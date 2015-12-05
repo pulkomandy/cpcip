@@ -1,0 +1,259 @@
+; CPC/IP configuration
+; Copyright (c) 1999-2001 Mark RISON
+
+
+FALSE		equ	0
+TRUE		equ	1
+
+; Define the memory configuration
+
+MEMCONFIG	equ	64	; Must be 64 or 128 (K)
+
+; Define the serial interface type and the serial parameters
+
+AMSTRAD		equ	TRUE
+PACE		equ	FALSE
+CPCAI		equ	FALSE
+BIT_RATE	equ	9600	; Must be divisible by 100
+PARITY_NONE	equ	TRUE
+PARITY_ODD	equ	FALSE
+PARITY_EVEN	equ	FALSE
+STOP_1		equ	TRUE
+STOP_1_5	equ	FALSE
+STOP_2		equ	FALSE
+INTDRIVEN	equ	TRUE
+HWFLOWCONTROL	equ	FALSE
+
+; Define the data-link layer protocol
+
+SLIP		equ	TRUE
+PPP		equ	FALSE
+
+; Define which bits should be included
+
+PING		equ	TRUE	; Ping client
+IFCONFIG	equ	TRUE	; IfConfig module
+TIMEOUT		equ	TRUE	; Timeout module
+LOOPBACK	equ	TRUE	; Loopback driver
+HOSTS		equ	TRUE	; hosts.txt module
+
+UDP		equ	TRUE	; UDP layer
+TFTPD		equ	TRUE	; TFTP daemon
+DNSD		equ	TRUE	; DNS server
+RESOLV		equ	TRUE	; Resolver module
+HOST		equ	TRUE	; DNS client
+
+TCP		equ	TRUE	; TCP layer
+HTTPD		equ	TRUE	; HTTP daemon
+TELNET		equ	TRUE	; Telnet client
+FINGER		equ	TRUE	; Finger client
+
+; Debug options
+
+SHOW_RAW_IN	equ	FALSE
+SHOW_RAW_OUT	equ	FALSE
+SHOW_INFO	equ	FALSE
+SHOW_ERROR	equ	TRUE
+SHOW_PPP	equ	TRUE
+DROP_OUT	equ	FALSE	; Drop 1 in n output datalink packets (0 = don't, 1 = invalid)
+MARK_HACKS	equ	FALSE
+
+; Protocol options
+
+CHECKSUM_PPP_IN	equ	TRUE	; Optional (but a good idea to keep LCP happy!)
+CHECKSUM_IP_IN	equ	TRUE	; Must be set for RFC1122-compliance (3.2.1.2)
+CHECKSUM_ICMP_IN equ	TRUE	; RFC1122 doesn't seem to specify this
+CHECKSUM_TFTP_OUT equ	TRUE	; For ACK packets (RFC112? FIXME)
+DEST_UNREACH	equ	TRUE	; RFC1122-optional (3.2.2.1)
+
+; ASCII control codes
+
+NUL		equ	0
+BEL		equ	7
+BS		equ	8
+TAB		equ	9
+LF		equ	10
+CR		equ	13
+ESC		equ	27
+DEL		equ	127
+
+; Miscellaneous
+
+PROMPT		equ	'>'
+SWITCH		equ	'-'
+
+; Symbol derivations
+
+if	MEMCONFIG - 64
+IS64K		equ	FALSE
+IS128K		equ	TRUE
+else
+IS64K		equ	TRUE
+IS128K		equ	FALSE
+endif
+
+if	INTDRIVEN
+POLLED		equ	FALSE
+else
+POLLED		equ	TRUE
+endif
+
+
+; Memory map for 128K memory configuration:
+;
+;	    -27ff	Free
+;	2800-2fff	AMSDOS read buffer
+;	3000-37ff	AMSDOS write buffer
+;	3800-7cff	Code
+;	7d00-7dff	Buffer for keyboard input
+;	7e00-7eff	Reserved for mode 2 text accelerator
+;	7f00-7fff	Reserved for screen blanker
+;	8000-83ff	Buffer for IP datagram (rx, and tx response)
+;	8400-87ff	Buffer for IP datagram (timeout/async tx)
+;	8800-8fff	Special code
+;	9000-		Free
+;
+;	Bank 4		RX serial buffer
+;	Bank 5		TX serial buffer
+;	Bank 6		Loopback buffer
+;	Bank 7		Free
+;
+; Note it's all a bit of a juggling act.
+;
+; In the 128K memory configuration, the serial device driver and
+; loopback driver can't be in bank 1 because they switch this out,
+; so they have to be below &4000 or above &7fff.
+;
+; The components which use events, however, can't be in bank 0
+; because event blocks must be in the central 32K, so have to be above &3fff!
+;
+; A polled serial device driver, which needs to do both,
+; therefore has to be placed in a special area in bank 2.
+;
+; It's a bit simpler in the 64K memory configuration; the only concern here
+; is the one about components using events not being in bank 0.
+;
+; The memory map for the 64K memory configuration changes as follows:
+;
+;	8800-8bff	TX serial buffer
+;	8c00-8fff	RX serial buffer
+;	9000-93ff	Loopback buffer
+;	9400-		Free
+
+; AMSDOS buffers are 2K in size and may be anywhere in RAM
+
+amsdosreadbuf	equ	&2800
+amsdoswritebuf	equ	&3000
+
+; The keyboard buffer is 256B in size (see main.z) and must be page-aligned
+
+keybbuffer	equ	&7d00
+
+; The rx IP buffer is 1K in size
+; and its base must have b9-b0 and b10 clear (see slip.z/ppp.z)
+
+ipbuffer	equ	&8000
+
+; The tx IP buffer is 1K in size
+; but may be anywhere in RAM
+
+iptxbuffer	equ	&8400
+
+if	IS128K
+
+; The loopback and serial tx and rx buffers are 16K in size
+; and their bases are all at &4000 (see serialdd.z and loopback.z)
+
+serialtxbuffer	equ	&4000
+serialtxbufsiz	equ	&4000
+serialrxbuffer	equ	&4000
+serialrxbufsiz	equ	&4000
+lobuffer	equ	&4000
+lobufsiz	equ	&4000
+
+specialcode	equ	&8800
+
+else	; !IS128K
+
+; The serial tx buffer must be 1K in size
+; and its base must have b9-b0 and b10 clear (see serialdd.z)
+
+serialtxbuffer	equ	&8800
+serialtxbufsiz	equ	&400
+
+; The serial rx buffer must be 1K in size
+; and its base must have b9-b0 clear and b10 set (see serialdd.z)
+
+serialrxbuffer	equ	&8c00
+serialrxbufsiz	equ	&400
+
+; The loopback buffer must be 1K in size
+; and its base must have b9-b0 and b10 clear (see loopback.z)
+
+lobuffer	equ	&9000
+lobufsiz	equ	&400
+
+endif	; IS128K
+
+
+org &3800
+
+jp	main
+
+
+.config_hostaddr
+
+; This host's address
+
+defb	192, 168, 6, 128	; Private address; see RFC1918
+
+
+.config_hosts_txt
+
+; The address of the hosts.txt data
+
+defw	hosts_txt
+
+
+.config_nameserveraddr
+
+; The address of the nameserver to use
+
+defb	127, 0, 0, 1		; This host; maybe it's running a dnsd
+
+
+.config_dns_resourcerecords
+
+; The address of the DNS server zone data
+
+defw	dns_resourcerecords
+
+
+if	PPP
+
+.config_pap_auth_req_pkt
+
+; This is the information to use in PPP authentication using PAP
+; Remember to guard this file and the binary if you make use of PAP!
+
+config_par_pktsiz equ config_pap_auth_req_pktend - config_pap_auth_req_pkt
+
+defb	PAP_AUTH_REQ, &42
+defb	config_par_pktsiz / 256, config_par_pktsiz and &ff
+defb	config_par_password - config_par_username - 1
+.config_par_username
+defb	"USERNAME"
+defb	config_pap_auth_req_pktend - config_par_password
+.config_par_password
+defb	"PASSWORD"
+.config_pap_auth_req_pktend
+defs	16			; Allow a bit more space for username/password
+
+endif
+
+
+.config_domain
+
+; This is the domain to append to dotless hostname address resolver lookups
+
+defb	"bufo-house.org", 0

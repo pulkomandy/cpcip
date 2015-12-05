@@ -1,0 +1,149 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<!-- http://www.nenie.org/cpcip/ -->
+
+<HTML>
+
+<HEAD>
+<TITLE>
+Bugs in CPC/IP's TCP layer
+</TITLE>
+</HEAD>
+
+<BODY>
+
+<H1>
+Bugs in CPC/IP's TCP layer
+</H1>
+
+CPC/IP's TCP layer is, sadly, not perfect.  Here are the
+know bugs.  Please <A HREF="mailto:mrison@hotmail.com">tell me</A>
+about any other bugs you discover!  Please distinguish between
+functional and non-functional bugs, and give as much information
+as possible so I can reproduce the problem.  And if you know of
+or have access to some sort of TCP test suite, I'd be very interested...
+
+<H2>
+Functional bugs
+</H2>
+
+<P>
+None of these are catastrophic, but...
+</P>
+
+<UL>
+<LI>
+There's no 2*MSL timeout; the TCP goes straight from TIME-WAIT to CLOSED
+(so old segments could in principle cause trouble).
+</LI>
+<LI>
+No check is made that the segment sent by the peer doesn't exceed
+the receive window (so the app just has to lump it).
+</LI>
+<LI>
+Simultaneous connections are not allowed (so two telnets
+connecting to each other at exactly the same time will fail).
+</LI>
+<LI>
+Bad ACKs in SYN-RECEIVED do not cause a connection reset.
+</LI>
+<LI>
+It's not possible to make a passive open go active (so can't
+go tcp_open after a tcp_listen).
+</LI>
+</UL>
+
+<H2>
+Non-functional bugs
+</H2>
+
+<P>
+These merely make things less efficient than they could be.
+</P>
+
+<UL>
+<LI>
+No attention is paid to the peer's receive window (so in particular
+if the peer sets this to zero CPC/IP just keeps trying every
+retransmission timeout).
+</LI>
+<LI>
+Segments partially containing old data are merely ACKed
+(to coax the peer into sending just new data); any new data
+is discarded.
+</LI>
+<LI>
+Data and/or FIN received in SYN-SENT is ignored (the peer is
+expected to resend it when only its SYN is ACKed).
+</LI>
+<LI>
+Data waiting for transmission is only sent when the ESTABLISHED
+state has been reached (it's not sent in segments sent in the SYN-SENT
+or SYN-RECEIVED state).
+</LI>
+<LI>
+The RTT is not measured; the retransmission timeout is
+fixed at 3 seconds.
+</LI>
+<LI>
+There's no support for urgent data.
+</LI>
+<LI>
+CPC/IP doesn't wait for 2*MSL after booting to ensure
+old segments have died off.
+</LI>
+<LI>
+There's no protection against being left in FIN-WAIT-2 forever.
+Nor is there any protection against retransmitting forever.
+</LI>
+</UL>
+
+<H2>
+Not bugs
+</H2>
+
+<P>
+CPC/IP supports the following; not all stacks do.
+</P>
+
+<UL>
+<LI>
+Half-closes (closing the transmit direction but still being
+able to receive until such time as the peer closes its
+transmit direction too).
+</LI>
+<LI>
+Concatenation of remaining data with a FIN.
+</LI>
+<LI>
+Not suddenly deciding to resend old data for no apparent reason.
+</LI>
+</UL>
+
+<P>
+Oh, and CPC/IP will send an ACK before passing received
+data to the app; this typically allows serial transfer
+and handling of received data to be done in parallel.
+</P>
+
+<HR>
+
+<P>
+Mark RISON,
+&lt;<A HREF="mailto:mrison@hotmail.com">mrison@hotmail.com</A>>,
+2001-06-03
+</P>
+
+<P>
+Thanks to Franck ARNAUD for hosting these pages.
+</P>
+
+<P>
+<A HREF="http://validator.w3.org/check/referer">
+<IMG BORDER="0" SRC="http://www.w3.org/Icons/valid-html32"
+     ALT="Valid HTML 3.2!" height="31" width="88">
+</A>
+</P>
+
+</BODY>
+
+</HTML>

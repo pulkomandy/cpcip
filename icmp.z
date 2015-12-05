@@ -1,0 +1,187 @@
+; CPC/IP ICMP layer
+; Copyright (c) 1999-2000 Mark RISON
+
+
+ICMP_TYPE		equ	0
+ICMP_CODE		equ	1
+
+ICMP_CSM1		equ	2
+ICMP_CSM0		equ	3
+
+ICMP_ID1		equ	4	; When ICMP_TYPE == ICMP_ECHO
+ICMP_ID0		equ	5	;   or ICMP_TYPE == ICMP_ECHO_REPLY
+
+ICMP_SEQ1		equ	6
+ICMP_SEQ0		equ	7
+
+ICMP_UNU3		equ	4	; When ICMP_TYPE == ICMP_DEST_UNREACH
+ICMP_UNU2		equ	5
+ICMP_UNU1		equ	6
+ICMP_UNU0		equ	7
+
+ICMP_HDRSIZE		equ	8
+
+ICMP_ECHO		equ	8	; Values for ICMP_TYPE
+ICMP_ECHO_REPLY		equ	0
+ICMP_DEST_UNREACH	equ	3
+
+ICMP_PROT_UNREACH	equ	2	; Values for ICMP_CODE
+ICMP_PORT_UNREACH	equ	3	; when ICMP_TYPE == ICMP_DEST_UNREACH
+
+
+.icmp
+
+; All ICMP messages contain at least 8 octets
+
+push	hl
+ld	hl, -ICMP_HDRSIZE
+add	hl, de
+pop	hl
+jr	nc, icmp_toosmall
+
+; Check the checksum
+
+push	de
+call	cs_calcicmpchecksum
+jr	nz, icmp_badchecksum
+pop	de
+
+; It's looking good!
+
+if	SHOW_INFO
+call	icmp_showinfo
+endif
+
+; Handle ICMP ECHO
+
+ld	a, (iy + ICMP_TYPE)
+cp	ICMP_ECHO
+jr	z, echo
+
+; Handle ICMP ECHO REPLY, if there's a client for it
+
+cp	ICMP_ECHO_REPLY
+ret	nz
+ld	bc, (icmp_client_echoreply)
+ld	a, b
+or	c
+ret	z
+push	bc			; JP (BC) with RET below
+
+.icmp_done
+
+ret
+
+
+.icmp_client_echoreply
+
+defw	0
+
+
+if	SHOW_ERROR
+
+.icmp_toosmall
+
+call	printstringimm
+defb	"ICMP: message too small: ", 0
+ld	a, e
+call	printdec
+jp	printcrlf
+
+if	CHECKSUM_ICMP_IN
+
+.icmp_badchecksum
+
+call	printstringimm
+defb	"ICMP: bad checksum: &", 0
+pop	hl
+ex	de, hl
+jp	printhex2crlf
+
+else
+
+icmp_badchecksum	equ	icmp_done
+
+endif
+
+else
+
+icmp_toosmall		equ	icmp_done
+icmp_badchecksum	equ	icmp_done
+
+endif
+
+
+.echo
+
+ld	(iy + ICMP_TYPE), ICMP_ECHO_REPLY
+call	cs_seticmpchecksum	; COULD optimise based on delta
+
+ld	(ix + IP_TTL), IP_DEFAULT_TTL
+call	cs_setipchecksum	; COULD optimise based on delta
+
+call	ip_swapsrcdest
+
+push	hl
+pop	bc
+jp	slip_sendpacket
+
+
+.icmp_senddestunreach
+
+; Send dest unreach ICMP message for received IP datagram
+; On entry, A = dest unreach code
+; On exit, lots of things corrupted!
+
+if	DEST_UNREACH
+
+push	ix
+pop	de
+ld	hl, IP_HDRSIZE + ICMP_HDRSIZE		; FIXME option headers
+add	hl, de			; HL -> ICMP payload
+ld	bc, IP_HDRSIZE + 8	; IP header + 64 bits ; FIXME option headers
+add	hl, bc
+ex	de, hl			; DE -> ICMP payload end + 1
+add	hl, bc			; HL -> (IP header + 64 bits) end + 1
+dec	hl
+dec	de
+lddr				; Note copy down
+
+ld	(ix + IP_HDRSIZE + ICMP_CODE), a	; FIXME option headers
+
+call	ip_swapsrcdest
+
+ld	(ix + IP_VERIHL), &45	; FIXME option headers
+ld	(ix + IP_LEN1), 0
+ld	(ix + IP_LEN0), IP_HDRSIZE + ICMP_HDRSIZE + IP_HDRSIZE + 8		; FIXME option headers
+ld	(ix + IP_TTL), IP_DEFAULT_TTL
+ld	(ix + IP_PRT), IP_ICMP
+call	cs_setipchecksum
+
+ld	(ix + IP_HDRSIZE + ICMP_TYPE), ICMP_DEST_UNREACH
+ld	(ix + IP_HDRSIZE + ICMP_CSM1), 0	; FIXME checksum
+ld	(ix + IP_HDRSIZE + ICMP_CSM0), 0	; FIXME checksum
+ld	(ix + IP_HDRSIZE + ICMP_UNU3), 0
+ld	(ix + IP_HDRSIZE + ICMP_UNU2), 0
+ld	(ix + IP_HDRSIZE + ICMP_UNU1), 0
+ld	(ix + IP_HDRSIZE + ICMP_UNU0), 0
+
+ld	bc, IP_HDRSIZE + ICMP_HDRSIZE + IP_HDRSIZE + 8		; FIXME option headers
+call	slip_sendpacket
+
+endif
+
+ret
+
+
+if	SHOW_INFO
+
+.icmp_showinfo
+
+call	printstringimm
+defb	"ICMP: message type ", 0
+ld	a, (iy + ICMP_TYPE)
+call	printdec
+jp	printcrlf
+
+endif

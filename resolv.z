@@ -1,0 +1,713 @@
+; CPC/IP resolver
+; Copyright (c) 1999-2000 Mark RISON
+
+
+RESOLV_RETX_TIMEOUT equ	5	; In seconds -- RFC1123 recommended minimum
+RESOLV_RETX_MAX	equ	5	; Some maximum is required by RFC1123 (6.1.3.3)
+DNS_TOS		equ	&10	; 1000 (minimise delay) -- RFC1700 recommended
+
+UDP_DNS		equ	53
+
+DNS_ID1		equ	8
+DNS_ID0		equ	9
+
+DNS_QFLAGS	equ	10
+DNS_QR_BIT	equ	7
+DNS_OPCODE_BASE	equ	3
+DNS_AA_BIT	equ	2
+DNS_TC_BIT	equ	1
+DNS_RD_BIT	equ	0
+DNS_QR		equ	&80
+DNS_OPCODE	equ	&78
+DNS_AA		equ	&04
+DNS_TC		equ	&02
+DNS_RD		equ	&01
+DNS_QUERY	equ	&00
+DNS_IQUERY	equ	&08
+DNS_STATUS	equ	&10
+
+DNS_RFLAGS	equ	11
+DNS_RA_BIT	equ	7
+DNS_RCODE_BASE	equ	0
+DNS_RA		equ	&80
+DNS_RCODE	equ	&0f
+
+; DNS server response status codes
+DNS_NOERR	equ	&00	; No error; more responses to come
+DNS_FMTERR	equ	&01	; Format error (resolver broken)
+DNS_SERVFAIL	equ	&02	; Server failure
+DNS_NAMEERR	equ	&03	; Domain name does not exist
+DNS_NOTIMPL	equ	&04	; Not implemented by server
+DNS_REFUSED	equ	&05	; Request refused
+
+; Extra status codes for resolver clients
+DNS_TRUNCATED	equ	&10	; Response truncated
+DNS_CORRUPT	equ	&80	; Response corrupt
+DNS_BUSY	equ	&81	; Resolver busy
+DNS_TIMEOUT	equ	&82	; Server not responding
+DNS_NOMORE	equ	&ff	; No more responses to come
+
+DNS_QDCOUNT1	equ	12
+DNS_QDCOUNT0	equ	13
+
+DNS_ANCOUNT1	equ	14
+DNS_ANCOUNT0	equ	15
+
+DNS_NSCOUNT1	equ	16
+DNS_NSCOUNT0	equ	17
+
+DNS_ARCOUNT1	equ	18
+DNS_ARCOUNT0	equ	19
+
+DNS_QNAME	equ	20
+
+DNS_A		equ	1
+DNS_NS		equ	2
+DNS_CNAME	equ	5
+DNS_SOA		equ	6
+DNS_PTR		equ	12
+DNS_HINFO	equ	13
+DNS_MX		equ	15
+DNS_TXT		equ	16
+DNS_ALL		equ	255
+
+DNS_IN		equ	1
+
+
+.resolv_init
+
+call	printstringimm
+defb	"resolver module initialised", CR, LF, 0
+
+; Set up UDP binding for DNS response
+
+ld	hl, resolv_active_bind
+call	udp_bind
+
+.resolv_reinit
+
+; Clear away any previous client request
+
+ld	hl, 0
+ld	(resolv_client), hl
+
+; Make sure not listening to DNS responses
+
+dec	hl			; &ffff because of LD HL above
+ld	(resolv_active_bind + UCP_OFFSETOF_REMPORT), hl
+
+ret
+
+
+.resolv_gethostbyname
+
+; Convert a numeric hostname to binary form; look up a textual hostname
+; in hosts.txt, querying the DNS server if not found
+;
+; On entry:
+;	HL -> query (must stay valid while resolver active)
+;	DE -> handler
+;
+; On exit:
+;	AF, BC, DE, HL, IX, IY corrupted
+;
+; For the handler, see resolv_query, with the following differences:
+; - Whatever the value of A on entry, DE and IY on entry never significant
+; - If A zero on entry, then may only access the four bytes pointed at by HL
+; - If A zero on entry, then must return with carry clear (want no more)
+;
+; A client which wants to do as little as possible can do just this:
+;
+;	.client_resolv_query
+;	ld	de, client_resolv_handler
+;	<HL points at query>
+;	jp	resolv_gethostbyname
+;
+;	.client_resolv_handler
+;	or	a
+;	jp	nz, resolv_whine
+;	<do something with address pointed at by HL>
+;	or	a	; Clear carry flag
+;	ret
+
+ld	bc, DNS_A		; In case goes to DNS server
+call	resolv_checkbusy
+
+ld	de, resolv_addr
+call	hosts_lookup
+jp	nz, resolv_do
+
+xor	a			; DNS_NOERR
+ld	hl, resolv_addr
+ld	ix, (resolv_client)
+call	callix
+jp	resolv_done
+
+.resolv_busy
+
+ld	a, DNS_BUSY
+ex	de, hl
+pop	de			; Pop stacked return addr in resolv_checkbusy
+jp	(hl)
+
+.resolv_checkbusy
+
+push	hl
+ld	hl, (resolv_client)
+ld	a, h
+or	l
+pop	hl
+jr	nz, resolv_busy
+
+ld	(resolv_pquery), hl
+ld	(resolv_client), de
+ld	(resolv_qtype), bc
+
+ret
+
+
+.resolv_whine
+
+; A useful little tail-end optimisation for resolver clients
+
+inc	a
+jr	z, resolv_notfound
+
+dec	a
+cp	DNS_NAMEERR
+jr	z, resolv_notfound
+
+call	printstringimm
+defb	"[Error resolving hostname: code &", 0
+call	printhex
+call	printstringimm
+defb	"]", CR, LF, 0
+jp	keyb_client_done
+
+.resolv_notfound
+
+call	printstringimm
+defb	"[Error: unknown host]", CR, LF, 0
+jp	keyb_client_done
+
+
+.resolv_query
+
+; Query the DNS server
+;
+; On entry:
+;	HL -> query (must stay valid while resolver active)
+;	DE -> handler
+;	BC = QTYPE
+;
+; On exit:
+;	AF, BC, DE, HL, IX, IY corrupted
+;
+; For the handler,
+;
+; On entry:
+;
+;	A = status code
+;
+;	If A zero (DNS_NOERR), then
+;	DE -> RR (can work forward e.g. to get TTL)
+;	HL -> RDATA
+;
+;	If A bit 7 clear or bit 6 set, then
+;	IY -> UDP packet (DNS data starts at offset 8)
+;	BIT DNS_AA_BIT, (IY + DNS_QFLAGS) set if authoritative
+;	BIT DNS_RA_BIT, (IY + DNS_RFLAGS) set if recursion available
+;
+; On exit:
+;
+;	If A on entry zero, then
+;	Carry set if want more answers
+;	Carry clear if not interested in more answers
+;
+;	If A on entry not zero or not interested in more answers, then
+;	corrupt AF, BC, DE, HL, IX, IY
+;	else
+;	corrupt AF, BC, DE, HL
+;
+; Note the handler may be jumped to immediately; the client must
+; be able to handle this (typically by making the call to this routine
+; the last thing it does).
+;
+; Note the two status codes which are most likely are zero (DNS_NOERR)
+; and 255 (DNS_NOMORE).
+;
+; A client which wants to do as little as possible can do just this:
+;
+;	.client_resolv_query
+;	ld	bc, <qtype>
+;	ld	de, client_resolv_handler
+;	<HL points at query>
+;	jp	resolv_query
+;
+;	.client_resolv_handler
+;	or	a
+;	jp	nz, resolv_whine
+;	<do something with RDATA pointed at by HL (from RR at DE)>
+;	or	a	; Clear carry flag
+;	ret
+
+call	resolv_checkbusy
+
+.resolv_do
+
+if	MARK_HACKS
+ld	hl, (resolv_pquery)
+ld	a, (hl)
+cp	'"'
+jr	nz, resolv_notfile
+call	printstringimm
+defb	"Reading from file ", 0
+inc	hl
+ld	d, h
+ld	e, l
+call	printstring
+or	a
+sbc	hl, de
+dec	hl
+call	printcrlf
+ld	b, l
+ex	de, hl
+ld	de, amsdosreadbuf
+call	CAS_IN_OPEN
+jr	nc, resolv_filerror
+ld	hl, ipbuffer
+CAS_IN_DIRECT	equ	&bc83
+call	CAS_IN_DIRECT
+jr	nc, resolv_filerror
+call	CAS_IN_CLOSE
+jr	nc, resolv_filerror
+ld	hl, (ipbuffer + IP_HDRSIZE + DNS_ID1)
+ld	(resolv_currentID), hl
+ld	ix, ipbuffer
+ld	iy, ipbuffer + IP_HDRSIZE
+jp	resolv_response
+.resolv_filerror
+call	printstringimm
+defb	"Problem reading file", CR, LF, 0
+call	CAS_IN_ABANDON
+.resolv_notfile
+endif
+
+; Create the retransmission timeout
+
+ld	hl, resolv_retx_timer
+ld	de, resolv_retx
+call	timeout_create
+
+ld	a, RESOLV_RETX_MAX + 1
+ld	(resolv_retrycount), a
+
+.resolv_redo
+
+; Assemble DNS query message
+
+ld	ix, iptxbuffer
+
+; Set up IP header
+
+ld	(ix + IP_VERIHL), IP_DEFAULT_VERIHL
+ld	(ix + IP_TOS), DNS_TOS
+call	ip_getID
+ld	(iptxbuffer + IP_ID1), hl
+ld	(ix + IP_FRG1), IP_DF
+ld	(ix + IP_FRG0), 0
+ld	(ix + IP_TTL), IP_DEFAULT_TTL
+ld	(ix + IP_PRT), IP_UDP
+
+ld	hl, config_hostaddr
+ld	de, iptxbuffer + IP_SRC3
+ld	bc, 4
+ldir				; DE = iptxbuffer + IP_DST3
+ld	hl, config_nameserveraddr
+ld	c, 4
+ldir
+
+; Set up UDP header
+
+call	ip_getranduserport
+ld	(resolv_active_bind + UCP_OFFSETOF_LCLPORT), hl
+ld	(iptxbuffer + IP_HDRSIZE + UDP_SRC1), hl
+ld	hl, UDP_DNS * &100	; * &100 so can be written little-endianly
+ld	(resolv_active_bind + UCP_OFFSETOF_REMPORT), hl
+ld	(iptxbuffer + IP_HDRSIZE + UDP_DST1), hl
+
+; Set up DNS query
+
+ld	h, 0			; L zero from LD HL above
+ld	(iptxbuffer + IP_HDRSIZE + DNS_ANCOUNT1), hl
+ld	(iptxbuffer + IP_HDRSIZE + DNS_NSCOUNT1), hl
+ld	(iptxbuffer + IP_HDRSIZE + DNS_ARCOUNT1), hl
+
+inc	h			; H now one (L still zero)
+ld	(iptxbuffer + IP_HDRSIZE + DNS_QDCOUNT1), hl
+
+dec	h			; H now zero again
+ld	l, DNS_QUERY or DNS_RD
+ld	(iptxbuffer + IP_HDRSIZE + DNS_QFLAGS), hl	; DNS_RFLAGS zeroed
+
+ld	hl, (resolv_currentID)
+inc	hl
+ld	(resolv_currentID), hl
+ld	(iptxbuffer + IP_HDRSIZE + DNS_ID1), hl	; Note written little-endianly
+
+; Fill in the QNAME
+
+ld	hl, (resolv_pquery)
+ld	de, iptxbuffer + IP_HDRSIZE + DNS_QNAME
+ld	c, 0			; C holds total QNAME length
+xor	a
+ld	(resolv_hasdot), a
+
+.resolv_writelabel
+
+push	de			; Stack address of label length
+inc	de
+ld	b, 0			; B holds label length
+
+.resolv_writelabelchar
+
+ld	a, (hl)
+call	util_isvalidinhostname
+jr	c, resolv_endoflabel
+
+inc	hl
+cp	'.'
+jr	z, resolv_endoflabelwithdot
+
+ld	(de), a
+inc	de
+inc	b
+jr	resolv_writelabelchar
+
+.resolv_endoflabelwithdot
+
+ld	(resolv_hasdot), a
+
+.resolv_endoflabel
+
+ex	(sp), hl		; Unstack address of label length ...
+ld	(hl), b			; ... and store label length
+pop	hl			; ... but preserving HL
+inc	c			; Account for label length octet
+
+ld	a, b
+or	a
+jr	z, resolv_endofhostname
+
+add	a, c			; Account for label length
+ld	c, a
+
+; A bit of pedantry to catch .. at the end of the address,
+; should this code ever be extended to report the end of the address
+
+ld	a, (hl)
+cp	'.'
+jr	nz, resolv_writelabel
+
+xor	a
+ld	(de), a
+inc	de
+inc	c
+
+.resolv_endofhostname
+
+; If there wasn't any dot in the address,
+
+ld	a, (resolv_hasdot)
+or	a
+jr	nz, resolv_dotty
+
+; and a domain has been configured
+
+ld	hl, config_domain
+ld	a, (hl)
+or	a
+jr	z, resolv_dotty
+
+; then add in the domain part
+
+ld	(resolv_hasdot), a	; Ensure this bit can only happen once
+dec	de			; Zap the trailing empty label
+dec	c
+jr	resolv_writelabel
+
+.resolv_dotty
+
+ld	b, 0			; BC now contains length of QNAME
+
+; Fill in the QTYPE and QCLASS
+
+ld	hl, (resolv_qtype)
+ex	de, hl
+ld	(hl), d
+inc	hl
+ld	(hl), e
+inc	hl
+ld	(hl), 0
+inc	hl
+ld	(hl), DNS_IN
+inc	hl
+ld	(hl), 0			; For odd-sized packets
+
+; Fire the request off
+
+ld	iy, iptxbuffer + IP_HDRSIZE
+
+ld	hl, DNS_QNAME + 4	; 4 for QTYPE and QCLASS
+add	hl, bc
+ld	(iy + UDP_LEN1), h
+ld	(iy + UDP_LEN0), l
+push	hl
+call	cs_setudpchecksum
+pop	bc
+call	cs_setlengthandchecksum
+call	slip_sendpacket
+
+; Start the retransmission timeout
+
+ld	hl, resolv_retx_timer
+ld	de, RESOLV_RETX_TIMEOUT * TICKS_PER_SEC
+call	timeout_set
+
+ret
+
+
+.resolv_active_bind
+
+defs	2
+defb	0, 0, 0, 0		; Any remote address (see RFC1035 section 7.3)
+defb	255, 255		; No remote port (filled only when active)
+defs	2			; Local port to be dynamically allocated
+defw	resolv_response
+
+.resolv_retx_timer
+
+defs	SIZEOF_TIMEOUT
+
+.resolv_currentID
+
+defw	0
+
+.resolv_pquery
+
+defs	2
+
+.resolv_qtype
+
+defs	2
+
+.resolv_hasdot
+
+defs	1
+
+.resolv_client
+
+defw	0
+
+.resolv_addr
+
+defs	4
+
+.resolv_RRstart
+
+defs	2
+
+.resolv_retrycount
+
+defs	1
+
+
+.resolv_retx
+
+ld	a, (resolv_retrycount)
+dec	a
+ld	(resolv_retrycount), a
+ld	a, DNS_TIMEOUT
+jp	z, resolv_response_timeout
+
+if	SHOW_INFO
+call	printcrlfmaybe
+call	printstringimm
+defb	"No reply from name server; trying again", CR, LF, 0
+endif
+
+jp	resolv_redo
+
+
+.resolv_skipname
+
+; Skip to end of DNS name
+;
+; On entry:
+;	HL -> (Q)NAME
+; On exit:
+;	HL -> first octet after (Q)NAME
+;	AF corrupted
+
+ld	a, (hl)			; Get label length/first octet of pointer
+inc	hl
+
+or	a			; Zero means root and so end
+ret	z
+
+bit	7, a			; Pointer has b7 (and b6) set
+inc	hl			; Eat second octet of pointer
+ret	nz
+
+dec	a			; To compensate for INC HL above
+add	a, l			; Add in label length
+ld	l, a
+ld	a, h
+adc	a, 0
+ld	h, a
+
+jr	resolv_skipname
+
+
+.resolv_response
+
+bit	DNS_QR_BIT, (iy + DNS_QFLAGS)
+ret	z			; Quietly discard any incoming queries
+
+ld	d, (iy + DNS_ID0)	; Note written little-endianly
+ld	e, (iy + DNS_ID1)
+ld	hl, (resolv_currentID)
+or	a
+sbc	hl, de
+ret	nz			; Quietly discard any responses with bad ID
+
+ld	a, DNS_TRUNCATED
+bit	DNS_TC_BIT, (iy + DNS_QFLAGS)
+jr	nz, resolv_response_truncated
+
+ld	a, (iy + DNS_RFLAGS)
+and	DNS_RCODE
+jr	nz, resolv_response_error
+
+; FIXME should do more checks:
+; - Length of message
+; - DNS_QDCOUNT (= 1)
+; - DNS_NS/AR/ANCOUNT1 (= 0)
+; - DNS_QFLAGS_OPCODE?
+; - DNS_QFLAGS_RD?
+; - CLASS (= IN)
+; - NAME (= QNAME, but this is a pain due to CNAMEs)
+; - Overrun due to corrupt response!
+; FIXME could make use of:
+; - DNS_QFLAGS_AA (but careful since only applies to query RRs)
+
+; Go through all the non-question sections since some name servers
+; seem to put answers to the question not in the answer section!
+; FIXME or have I missed the point?
+
+ld	a, (iy + DNS_ANCOUNT0)
+add	a, (iy + DNS_NSCOUNT0)
+add	a, (iy + DNS_ARCOUNT0)
+ld	(iy + DNS_ANCOUNT0), a
+or	a
+jr	z, resolv_doneRRs
+
+; Skip to end of QNAME
+
+push	iy
+ld	de, DNS_QNAME
+add	iy, de
+push	iy
+pop	hl
+pop	iy
+call	resolv_skipname
+ld	de, 4			; QTYPE and QCLASS
+add	hl, de
+
+.resolv_donextRR
+
+; Go through the answer RRs looking for A RRs
+
+ld	(resolv_RRstart), hl
+call	resolv_skipname		; NAME
+ld	d, (hl)			; TYPE
+inc	hl
+ld	e, (hl)
+inc	hl
+push	hl
+ld	hl, (resolv_qtype)	; Check against QTYPE
+ld	a, l			; If QTYPE was DNS_ALL (255) then pass all
+inc	a
+or	h
+jr	z, resolv_wasforall
+or	a
+sbc	hl, de
+.resolv_wasforall
+pop	hl
+push	af
+ld	de, 2 + 4		; CLASS and TTL
+add	hl, de
+ld	d, (hl)			; Get RDLENGTH
+inc	hl
+ld	e, (hl)
+inc	hl
+pop	af
+call	z, resolv_found
+add	hl, de			; RDATA
+
+dec	(iy + DNS_ANCOUNT0)
+jr	nz, resolv_donextRR
+
+.resolv_doneRRs
+
+ld	a, DNS_NOMORE
+
+.resolv_response_corrupt
+.resolv_response_truncated
+.resolv_response_error
+.resolv_response_timeout
+
+ld	hl, (resolv_client)
+call	callhl
+
+jr	resolv_done
+
+.resolv_found
+
+push	de
+push	hl
+xor	a			; DNS_NOERR
+ld	de, (resolv_RRstart)
+ld	ix, (resolv_client)
+call	callix
+pop	hl
+pop	de
+
+ret	c			; Return if client wants more
+
+pop	hl			; Pop call address
+jr	resolv_done
+
+
+.resolv_done
+.resolv_abort
+
+call	resolv_reinit
+
+; Stop the retransmission timeout
+
+ld	hl, resolv_retx_timer
+jp	timeout_destroy
+
+
+.resolv_final
+
+; Cancel any UDP binding for DNS response
+
+ld	hl, resolv_active_bind
+call	udp_close
+
+; Stop any retransmission timeout
+
+ld	hl, resolv_retx_timer
+jp	timeout_destroy

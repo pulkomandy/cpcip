@@ -1,0 +1,41 @@
+CPC/IP v0.20, a TCP/IP stack for
+Amstrad CPCs.  Includes:
+- An Amstrad/Pace serial interface driver
+- A CPC Amstrad Int'l serial interface driver
+- A loopback driver
+- A SLIP layer
+- A PPP layer
+- IP and ICMP layers (so can be pinged)
+- UDP and TCP layers
+- A resolver
+- A DNS server
+- A TFTP server, write-only
+- An HTTP/0.9 server
+- A ping client
+- A host client
+- A finger client
+- A telnet client
+- Source
+
+CPC/IP v0.20, une pile TCP/IP pour
+Amstrad CPC.  Inclut:
+- Un driver pour interface serie Amstrad/Pace
+- Un driver pour interface serie CPC Ams Int'l
+- Un driver pour rebouclage
+- Une couche SLIP (hehe)
+- Une couche PPP
+- Des couches IP et ICMP (on peut donc pinger)
+- Des couches UDP et TCP
+- Un resolveur
+- Un serveur DNS
+- Un serveur TFTP, ecriture-seule
+- Un server HTTP/0.9
+- Un client ping
+- Un client host
+- Un client finger
+- Un client telnet
+- Sources
+
+Copyright (c) 1999-2001 Mark RISON,
+<mrison@hotmail.com>.
+http://www.nenie.org/cpcip/

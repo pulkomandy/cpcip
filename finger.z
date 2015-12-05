@@ -1,0 +1,281 @@
+; CPC/IP finger client
+; Copyright (c) 1999-2001 Mark RISON
+
+
+.finger_syntax
+
+call	printstringimm
+defb	"finger [/W] [user]@host", CR, LF, 0
+jp	keyb_client_done
+
+
+TCP_FINGER	equ	79
+FINGER_BUFSIZ	equ	10
+
+; FIXME why is it that having a RCVWND less than 536 really impairs throughput?  Is it something to do with the congestion window/SWS avoidance?
+
+
+.finger_init
+
+call	printstringimm
+defb	"finger client initialised", CR, LF, 0
+ret
+
+
+.finger_do
+
+; Check for absence of arguments
+
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	z, finger_syntax
+
+; Look for the @ which marks the host
+
+.finger_findat
+
+ld	a, (hl)
+cp	'@'
+jr	z, finger_foundat
+
+inc	hl
+or	a
+jr	nz, finger_findat
+
+jr	finger_syntax
+
+
+.finger_foundat
+
+; OK, we've got the host address
+
+ld	(hl), NUL		; Squash @
+inc	hl
+
+; Register key handler (for CTRL-C to abort resolving)
+
+ex	de, hl
+ld	hl, finger_keyhandler_resolv
+call	keyb_client_doing
+ex	de, hl
+
+; Look up the address using the resolver
+
+call	printstringimm
+defb	"[Abort character is '^C']", CR, LF, 0
+
+ld	de, finger_resolved
+jp	resolv_gethostbyname
+
+
+.finger_resolved
+
+; Check what the status code says
+
+or	a			; DNS_NOERR
+jp	nz, resolv_whine
+
+; Resolved OK!
+
+ld	de, finger_active_bind + UCP_OFFSETOF_REMADDR
+ld	bc, 4
+ldir
+
+; Register key handler (for CTRL-C to abort fingering)
+
+ld	hl, finger_keyhandler
+call	keyb_client_doing
+
+; Confirm details
+
+call	printstringimm
+defb	"[", 0
+ld	hl, finger_active_bind + UCP_OFFSETOF_REMADDR
+call	printipaddr
+call	printstringimm
+defb	"]", CR, LF, 0
+
+; Initialise state
+
+ld	hl, 0
+ld	(finger_active_bind + UCP_OFFSETOF_EXTRA + TCP_OFFSETOF_SNDNUN), hl
+ld	hl, keybbuffer
+call	util_skipspace
+call	util_skiptospace
+ld	(finger_pos), hl
+
+; Choose random local port for TCP
+
+call	ip_getranduserport
+ld	(finger_active_bind + UCP_OFFSETOF_LCLPORT), hl
+
+; Open TCP socket
+
+ld	hl, finger_active_bind
+call	tcp_connect
+
+or	a			; Remember the resolver?
+ret				; Make sure it's thanked but turned away
+
+
+.finger_active_bind
+
+defs	2			; Linked-list link
+defs	4			; Remote address
+defb	0, TCP_FINGER		; Remote port
+defs	2			; Local port
+defs	2			; TCP state handler
+defs	1			; TCP state
+defw	0			; Connection request upcall
+defw	finger_receive		; Receive upcall
+defw	finger_sent		; Sent upcall
+defw	finger_connclosed	; Connection closed upcall
+defs	4			; SNDUNA
+defs	4			; RCVNXT
+defw	536			; RCVWND
+defs	SIZEOF_TIMEOUT		; TCP retransmission timeout
+defw	0			; SNDNUN
+defs	FINGER_BUFSIZ		; SNDBUF
+
+.finger_pos
+
+defs	2
+
+
+.finger_sent
+
+ld	bc, (finger_pos)	; BC -> next part of username to buffer
+ld	a, (bc)
+or	a
+ret	z
+
+ld	de, (finger_active_bind + UCP_OFFSETOF_EXTRA + TCP_OFFSETOF_SNDNUN)
+ld	hl, finger_active_bind + UCP_OFFSETOF_EXTRA + TCP_OFFSETOF_SNDBUF
+add	hl, de			; DE -> first free in SNDBUF
+ex	de, hl			; HL = SNDNUN
+
+.finger_sent_copy
+
+ld	a, (bc)
+or	a
+jr	z, finger_sent_copy_done
+ld	(de), a
+inc	bc
+inc	de
+inc	hl
+
+push	bc
+push	hl
+ld	bc, FINGER_BUFSIZ - 2
+sbc	hl, bc			; C clear from OR above
+pop	hl
+pop	bc
+jr	c, finger_sent_copy
+
+.finger_sent_copy_done
+
+ld	a, (bc)
+or	a
+jr	nz, finger_sent_copy_done_for_now
+
+ld	a, CR
+ld	(de), a
+inc	hl
+ld	a, LF
+ld	(de), a
+inc	hl
+
+.finger_sent_copy_done_for_now
+
+ld	(finger_pos), bc
+ld	(finger_active_bind + UCP_OFFSETOF_EXTRA + TCP_OFFSETOF_SNDNUN), hl
+
+ret
+
+
+.finger_receive
+
+call	TXT_CUR_OFF
+jr	finger_receive_start
+
+.finger_receive_loop
+
+ld	a, (iy + 0)
+push	de
+cp	LF			; Cope with just LF as NL
+call	z, printcrlf		; (for broken fingerd implementations)
+call	nz, printcharsafe
+pop	de
+inc	iy
+dec	de
+
+.finger_receive_start
+
+ld	a, d
+or	e
+jr	nz, finger_receive_loop
+
+call	TXT_CUR_ON
+
+ret
+
+
+.finger_keyhandler
+
+cp	CTRL_C			; It's that or nothing
+ret	nz
+
+call	printcrlfmaybe
+call	printstringimm
+defb	"[Connection aborted]", CR, LF, 0
+
+jr	finger_done
+
+
+.finger_keyhandler_resolv
+
+cp	CTRL_C			; It's that or nothing
+ret	nz
+
+call	resolv_abort
+
+jr	finger_done
+
+
+.finger_connreset
+
+call	printstringimm
+defb	"[Connection reset by remote host]", CR, LF, 0
+jr	finger_done
+
+.finger_connclosed
+
+ld	a, d
+cp	TCP_CLOSE_REMOTE
+jp	z, tcp_close
+
+cp	TCP_CLOSE_NORMAL
+jr	z, finger_connclosednormal
+
+call	printcrlfmaybe
+
+cp	TCP_CLOSE_RESET
+jr	z, finger_connreset
+
+call	printstringimm
+defb	"[Connection refused by remote host]", CR, LF, 0
+
+.finger_connclosednormal
+
+.finger_done
+.finger_final
+
+; Close TCP socket if open
+
+ld	hl, finger_active_bind
+call	tcp_abort
+
+; Give keyboard back to command line input
+
+jp	keyb_client_done

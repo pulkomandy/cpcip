@@ -1,0 +1,747 @@
+; CPC/IP TFTP server
+; Copyright (c) 1999-2000 Mark RISON
+
+
+UDP_TFTP	equ	69
+
+TFTP_OPC1	equ	8
+TFTP_OPC0	equ	9
+
+TFTP_RRQ	equ	1
+TFTP_WRQ	equ	2
+TFTP_DATA	equ	3
+TFTP_ACK	equ	4
+TFTP_ERROR	equ	5
+
+TFTP_BLK1	equ	10
+TFTP_BLK0	equ	11
+
+TFTP_ERC1	equ	10
+TFTP_ERC0	equ	11
+
+TFTP_KEEPALIVE_TIMEOUT	equ 30	; In seconds
+
+
+; FIXME needs rewrite
+;
+; Use stdio routines (including use of handles)
+;
+; Algorithm should be:
+;
+; - Have n bindings, originally all free
+;   (only worth having i+o+1 where i/o = max open input/output files)
+;
+; - When get RRQ on empty binding:
+;	- Open file as read (send error if problem)
+;	- Store dir
+;	- Set remote addr and port and random local port on binding B
+;	- Read block 1 in, set block being transmitted n to 1
+;	- Send block (1)
+;	- Reset tx count
+;	- Start tx timeout for that binding
+;	- Note if block 1 lost then sender will resend RRQ,
+;	  and this will come to a new binding, which will only
+;	  work if we have a new binding and can support multiple
+;	  reads of the same file.  It's hard to do better since
+;	  we'd need to maintain an extra binding for a tx from
+;	  that remote addr and port but local port UDP_TFTP
+;	  (and simply resend the block, restart timeout and inc tx count) --
+;	  and/or have some yucky coupling between bindings!
+; - When get WRQ on empty binding:
+;	- Open file as write (send error if problem)
+;	- Store dir
+;	- Set remote addr and port and random local port on binding B
+;	- Set next expected block n to 1
+;	- Send ack (0)
+;	- Start overall timeout for that binding
+;	- Note if ack 0 lost then sender will resend WRQ,
+;	  and this will come to a new binding, which will only
+;	  work if we have a new binding and can support multiple
+;	  opens for write of the same file (unlikely!).  It's
+;	  hard to do better since we'd need to maintain an
+;	  extra binding for a tx from that remote addr and port
+;	  but local port UDP_TFTP (and simply ack that) --
+;	  and/or have some yucky coupling between bindings!
+; - When get other on empty binding:
+;	- Ignore
+;
+; - When get ERROR on B
+;	- Abort
+;
+; - When get DATAm on B and dir is WRQ
+;	- If m=n write block out, increment n and restart timeout
+;	  (terminate if done)
+;	- If m=n or n-1 ack (perhaps check for m=0),
+;	  else send protocol violation error and abort
+; - When get timeout on B and dir is WRQ
+;	- Abort
+;
+; - When get ACKm on B and dir is RRQ
+;	- If m=n increment n, read next block in,
+;	  reset tx count and restart timeout
+;	  (terminate if done),
+;	  else if m=n-1 do nothing (Sorcerer's Apprentice fix),
+;	  else send protocol violation error and abort
+; - When get timeout on B and dir is RRQ
+;	- Increment tx count
+;	- If hit max tx count, send error and abort,
+;	  else resend current packet and restart timeout
+;
+; - When get any other packet on B
+;	- Send protocol violation error and abort
+
+
+.tftp_init
+
+call	printstringimm
+defb	"TFTP server initialised", CR, LF, 0
+
+; Set up UDP bindings for TFTP
+
+ld	hl, tftp_active_bind
+call	udp_bind
+ld	hl, tftp_server_bind
+jp	udp_bind
+
+
+.tftp_server_bind
+
+defs	2
+defb	0, 0, 0, 0		; Any src address
+defb	0, 0			; Any src port
+defb	UDP_TFTP / 256, UDP_TFTP and &ff
+defw	tftp_starttransfer
+
+.tftp_active_bind
+
+defs	2
+defb	255, 255, 255, 255	; No src address
+defb	255, 255		; No src port
+defs	2			; To be dynamically allocated
+defw	tftp_activetransfer
+
+
+.tftp_activetransfer
+
+; UDP TFTP DATA datagrams have at least 8 (UDP) + 2 (OPC) + 2 (BLK) = 12 octets
+
+push	hl
+ld	hl, -12
+add	hl, de
+pop	hl
+jp	nc, tftp_toosmall
+
+; Are we dealing with a TFTP DATA packet?
+
+xor	a
+cp	(iy + TFTP_OPC1)
+jp	nz, tftp_unexpop
+ld	a, (iy + TFTP_OPC0)
+cp	TFTP_DATA
+jp	nz, tftp_unexpop
+
+; Have we received the next expected block?
+
+push	de
+push	hl
+ld	hl, (tftp_seqexpected)
+ld	d, (iy + TFTP_BLK1)
+ld	e, (iy + TFTP_BLK0)
+call	cphlde
+jr	z, tftp_active_asexpected
+
+; Have we received the block we've just received?
+
+dec	hl			; COULD make sure this is not zero
+call	cphlde
+pop	hl
+pop	de
+jp	nz, tftp_active_unexpseq
+
+ld	bc, (tftp_seqexpected)
+dec	bc
+
+if	SHOW_ERROR
+
+push	hl
+call	printstringimm
+defb	"TFTP: DATA: rereceived block ", 0
+push	bc
+pop	hl
+call	printdec2
+call	printcrlf
+pop	hl
+
+endif
+
+call	tftp_keepalive_alive
+
+jp	tftp_sendack
+
+.tftp_active_asexpected
+
+pop	hl
+pop	de
+
+if	SHOW_INFO
+
+push	hl
+call	printstringimm
+defb	"TFTP: DATA: received block ", 0
+ld	h, (iy + TFTP_BLK1)
+ld	l, (iy + TFTP_BLK0)
+call	printdec2
+call	printcrlf
+pop	hl
+
+endif
+
+call	tftp_keepalive_alive
+
+ld	bc, (tftp_seqexpected)
+
+push	bc
+push	de
+push	hl
+push	ix
+
+ld	h, (iy + UDP_LEN1)
+ld	l, (iy + UDP_LEN0)
+ld	de, 12
+or	a
+sbc	hl, de
+jr	z, tftp_save_nodata
+ex	de, hl			; DE = number of data bytes
+
+push	bc
+push	de
+
+push	iy
+pop	bc
+add	hl, bc			; HL = base of data
+ld	ix, CAS_OUT_CHAR
+
+.tftp_save
+
+ld	a, (hl)
+call	quietcas
+jr	nc, tftp_save_error
+inc	hl
+dec	de
+ld	a, d
+or	e
+jr	nz, tftp_save
+
+pop	de
+pop	bc
+
+.tftp_save_nodata
+
+inc	bc
+ld	(tftp_seqexpected), bc
+
+ld	hl, 512
+call	cphlde
+jr	z, tftp_notdone
+
+ld	ix, CAS_OUT_CLOSE
+call	quietcas
+jr	nc, tftp_close_error
+call	tftp_done
+
+.tftp_notdone
+
+pop	ix
+pop	hl
+pop	de
+pop	bc
+
+jp	tftp_sendack
+
+.tftp_save_error
+
+pop	de
+pop	bc
+
+.tftp_close_error
+
+pop	ix
+pop	hl
+pop	de
+pop	bc
+
+jp	tftp_senderror
+
+
+.tftp_active_unexpseq		; COULD send TFTP_ERROR
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"TFTP: unexpected sequence number: ", 0
+ld	h, (iy + TFTP_BLK1)
+ld	l, (iy + TFTP_BLK0)
+call	printdec2
+call	printcrlf
+endif
+
+ret
+
+
+.tftp_starttransfer
+
+; UDP TFTP WRQ/RRQ datagrams have at least 8 (UDP) + 2 (OPC) +
+; 2 (filename) + 2 (mode) = 14 octets
+
+push	hl
+ld	hl, -14
+add	hl, de
+pop	hl
+jp	nc, tftp_toosmall
+
+; Are we dealing with a TFTP WRQ packet?
+
+xor	a
+cp	(iy + TFTP_OPC1)
+jr	nz, tftp_unexpop
+ld	a, (iy + TFTP_OPC0)
+;cp	 TFTP_RRQ
+;jr	 z, tftp_start_rrq
+cp	TFTP_WRQ
+jr	z, tftp_start_wrq
+
+.tftp_unexpop
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"TFTP: unexpected opcode: ", 0
+ld	h, (iy + TFTP_OPC1)
+ld	l, (iy + TFTP_OPC0)
+call	printdec2
+call	printcrlf
+endif
+
+ret
+
+.tftp_start_unexpseq		; COULD send TFTP_ERROR
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"TFTP: unexpected repeated WRQ", CR, LF, 0
+endif
+
+ret
+
+.tftp_start_wrq
+
+ld	a, (tftp_seqexpected + 1)
+or	a
+jr	nz, tftp_start_unexpseq
+ld	a, (tftp_seqexpected)
+cp	2
+jr	nc, tftp_start_unexpseq
+or	a
+
+if	SHOW_ERROR
+
+jr	z, tftp_notrestart	; COULD check same filename and filemode
+call	printstringimm
+defb	"TFTP: WRQ: rereceived", CR, LF, 0
+.tftp_notrestart
+
+endif
+
+jp	nz, tftp_start_reack
+
+if	SHOW_INFO
+
+push	de
+push	hl
+call	printstringimm
+defb	"TFTP: WRQ: filename ", 0
+push	iy
+pop	hl
+ld	de, 10
+add	hl, de
+call	printstringsafe
+call	printstringimm
+defb	", filemode ", 0
+call	printstringsafe
+call	printcrlf
+pop	hl
+pop	de
+
+endif
+
+push	de
+push	hl
+
+ld	hl, tftp_keepalive_timer ; Initialise a one-shot keepalive timeout
+ld	de, tftp_keepalive_died
+call	timeout_create
+
+call	ip_getranduserport	; Get random port number and force as active bind dest port
+ld	(tftp_active_bind + 8), hl
+
+ld	h, (iy + UDP_SRC0)	; Get src port and force as bind src port
+ld	l, (iy + UDP_SRC1)
+ld	(tftp_server_bind + 6), hl
+ld	(tftp_active_bind + 6), hl
+
+push	ix
+pop	hl
+ld	de, 12			; Force src addr as bind src addr
+add	hl, de
+push	hl
+ld	de, tftp_server_bind + 2
+ld	bc, 4
+ldir
+pop	hl
+ld	de, tftp_active_bind + 2
+ld	c, 4
+ldir
+
+push	ix
+
+push	iy
+pop	hl
+ld	de, 10			; The filename starts at offset 10
+add	hl, de
+
+call	strlen			; Anything more than AMSDOS can cope with will be faulted on open
+ld	b, a
+
+ld	de, amsdoswritebuf
+ld	ix, CAS_OUT_OPEN
+call	quietcas
+
+pop	ix
+
+pop	hl
+pop	de
+
+jp	nc, tftp_senderror
+
+.tftp_start_reack
+
+call	tftp_keepalive_alive
+
+ld	bc, 1
+ld	(tftp_seqexpected), bc
+dec	bc
+jr	tftp_sendack
+
+
+.tftp_final
+
+; Close down any active TFTP session
+
+call	tftp_done
+
+; Close UDP bindings for TFTP
+
+ld	hl, tftp_active_bind
+call	udp_close
+ld	hl, tftp_server_bind
+jp	udp_close
+
+
+.tftp_done
+
+call	CAS_OUT_ABANDON			; Avoid trouble with R/O discs (grr...)
+
+ld	hl, tftp_keepalive_timer	; Disable the keepalive timeout
+call	timeout_destroy
+
+ld	hl, tftp_server_bind + 2	; Reopen server to all comers
+ld	de, tftp_server_bind + 3
+ld	bc, 5
+ld	(hl), 0
+ldir
+
+inc	hl
+ld	(hl), UDP_TFTP / 256
+inc	hl
+ld	(hl), UDP_TFTP and &ff
+
+ld	hl, tftp_active_bind + 2	; Close down active port
+ld	de, tftp_active_bind + 3
+ld	bc, 5
+ld	(hl), &ff
+ldir
+
+ld	(tftp_seqexpected), bc	; Reinitialise ready for next WRQ/RRQ
+
+ret
+
+
+.tftp_sendack
+
+push	de
+call	ip_swapsrcdest
+pop	de
+ld	a, (iy + UDP_SRC1)
+ld	(iy + UDP_DST1), a
+ld	a, (iy + UDP_SRC0)
+ld	(iy + UDP_DST0), a
+ld	a, (tftp_active_bind + 8)
+ld	(iy + UDP_SRC1), a
+ld	a, (tftp_active_bind + 9)
+ld	(iy + UDP_SRC0), a
+ld	(iy + UDP_LEN1), 0
+ld	(iy + UDP_LEN0), 12
+ld	(iy + TFTP_OPC1), 0
+ld	(iy + TFTP_OPC0), TFTP_ACK
+ld	(iy + TFTP_BLK1), b
+ld	(iy + TFTP_BLK0), c
+if	CHECKSUM_TFTP_OUT
+call	cs_setudpchecksum
+else
+ld	(iy + UDP_CSM1), 0
+ld	(iy + UDP_CSM0), 0
+endif
+
+ld	bc, 12
+call	cs_setlengthandchecksum
+jp	slip_sendpacket
+
+
+.tftp_senderror
+
+cp	&09			; "disc changed" appears not
+jr	nz, tftp_notstrangechange ; to be &15 as per Soft 968 but &09
+ld	a, &15
+.tftp_notstrangechange
+res	7, a			; Clear the "already reported" bit
+ld	hl, tftp_errors
+or	a
+jr	z, tftp_escpressed
+bit	6, a
+jr	z, tftp_notfdcerror
+bit	3, a
+jr	z, tftp_notdiscmissing
+ld	a, &c			; Disc missing mapped to &c
+jr	tftp_wasdiscmissing
+.tftp_notdiscmissing
+bit	1, a
+ld	a, &d			; Disc R/O mapped to &d
+jr	nz, tftp_wasdiscro
+ld	a, &b			; Misc FDC error mapped to &b
+.tftp_wasdiscmissing
+.tftp_wasdiscro
+.tftp_notfdcerror
+cp	&10			; AMSDOS bug work-around...
+call	z, tftp_determinediscmissing
+cp	&1a
+jr	nz, tftp_notsofteof
+ld	a, &17			; Soft EOF mapped to &17
+.tftp_notsofteof
+sub	9			; So misc FDC remapped to 2, etc.
+cp	15			; Max is &17 - 9 = 14
+jr	c, tftp_notunknown
+ld	a, 1			; Anything above that mapped to 1
+.tftp_notunknown
+ld	b, a
+xor	a
+.tftp_finderror
+cp	(hl)
+inc	hl
+jr	nz, tftp_finderror
+djnz	tftp_finderror
+
+.tftp_escpressed
+
+ld	a, (hl)
+dec	a			; Error code
+ld	(iy + TFTP_ERC1), 0
+ld	(iy + TFTP_ERC0), a
+inc	hl
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"TFTP: ", 0
+push	hl
+call	printstring
+pop	hl
+call	printcrlf
+endif
+
+push	hl
+push	iy
+pop	de
+ex	de, hl
+ld	bc, 12			; Error msg
+add	hl, bc
+ex	de, hl
+call	strlen
+ld	c, a
+inc	c
+ldir
+xor	a			; Force any odd octet to 0 for checksum
+ld	(de), a
+pop	hl
+
+call	ip_swapsrcdest
+
+call	strlen
+add	a, 13			; UDP header + ERROR opcode + error code + NUL
+ld	(iy + UDP_LEN1), 0
+ld	(iy + UDP_LEN0), a
+ld	b, 0
+ld	c, a
+
+ld	a, (iy + UDP_SRC1)
+ld	(iy + UDP_DST1), a
+ld	a, (iy + UDP_SRC0)
+ld	(iy + UDP_DST0), a
+ld	a, (tftp_active_bind + 8)
+ld	(iy + UDP_SRC1), a
+ld	a, (tftp_active_bind + 9)
+ld	(iy + UDP_SRC0), a
+ld	(iy + TFTP_OPC1), 0
+ld	(iy + TFTP_OPC0), TFTP_ERROR
+if	CHECKSUM_TFTP_OUT
+call	cs_setudpchecksum
+else
+ld	(iy + UDP_CSM1), 0
+ld	(iy + UDP_CSM0), 0
+endif
+
+call	cs_setlengthandchecksum
+jp	slip_sendpacket
+
+
+.tftp_errors
+
+defb	1, "Escape pressed", 0			; &00
+defb	1, "Unknown error!", 0			; new 1
+defb	1, "FDC error", 0			; new &0b
+defb	3, "Disc missing", 0			; new &0c
+defb	3, "Disc read-only", 0			; new &0d
+defb	1, "File not open as expected", 0	; &0e
+defb	1, "EOF met", 0				; &0f
+defb	3, "Bad filename", 0			; &10
+defb	7, "File already exists", 0		; &11
+defb	2, "File doesn't exist", 0		; &12
+defb	4, "Directory full", 0			; &13
+defb	4, "Disc full", 0			; &14
+defb	1, "Disc changed", 0			; &15
+defb	3, "File read-only", 0			; &16
+defb	1, "Soft EOF met", 0			; &1a, remapped to &17
+
+
+.tftp_determinediscmissing
+
+push	bc
+push	de
+push	hl
+push	ix
+push	iy
+
+ld	hl, tftp_get_dr_status
+call	KL_FIND_COMMAND
+jr	nc, tftp_determinehuh
+
+ld	a, (AMSDOS_DRIVE)
+call	KL_FAR_PCHL
+jr	c, tftp_spong
+
+inc	hl
+ld	a, (hl)
+
+.tftp_spong
+
+bit	5, a
+ld	a, &0c
+jr	z, tftp_determinedone
+
+.tftp_determinehuh
+
+ld	a, &10
+
+.tftp_determinedone
+
+pop	iy
+pop	ix
+pop	hl
+pop	de
+pop	bc
+
+ret
+
+.tftp_get_dr_status
+
+defb	&88			; BIOS GET DR STATUS
+
+
+.tftp_keepalive_alive		; If we've just died, too bad
+
+push	hl
+push	de
+ld	hl, tftp_keepalive_timer
+ld	de, TFTP_KEEPALIVE_TIMEOUT * TICKS_PER_SEC
+call	timeout_set
+pop	de
+pop	hl
+
+ret
+
+
+.tftp_keepalive_died
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"TFTP: transfer timed out", CR, LF, 0
+endif
+
+jp	tftp_done
+
+
+.tftp_keepalive_timer
+
+defs	SIZEOF_TIMEOUT
+
+.tftp_seqexpected
+
+defw	0
+
+.tftp_toosmall
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"TFTP: datagram too small: ", 0
+ld	a, e
+call	printdec
+call	printcrlf
+endif
+
+ret
+
+
+.quietcas
+
+; Use with IX = CAS_OUT_OPEN, CAS_OUT_CHAR or CAS_OUT_CLOSE,
+; and AMSDOS is prevented from making
+; a spectacle (e.g. it will normally print out "Bad command" if no
+; disc is present, even if messages have been disabled).
+; This routine should only be used if AMSDOS messages have been
+; disabled (sic).
+
+push	af
+ld	a, (TXT_OUTPUT)		; Get original opcode at TXT_OUTPUT
+ld	(quietcas_txtoutputorig), a
+ld	a, &c9			; Patch to RET
+ld	(TXT_OUTPUT), a
+pop	af
+
+call	callix
+
+push	af
+ld	a, (quietcas_txtoutputorig)
+ld	(TXT_OUTPUT), a		; Restore (was almost certainly RST 1)
+pop	af
+
+ret
+
+.quietcas_txtoutputorig
+
+defb	1

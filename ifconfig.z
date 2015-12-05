@@ -1,0 +1,118 @@
+; CPC/IP ifconfig module
+; Copyright (c) 1999-2001 Mark RISON
+
+
+.ifconfig_syntax
+
+call	printstringimm
+defb	"ifconfig (- | hostaddr) [nameserveraddr]", CR, LF, 0
+jp	keyb_client_done
+
+
+.ifconfig_init
+
+call	printstringimm
+defb	"ifconfig module initialised", CR, LF, 0
+
+.ifconfig_final
+
+ret
+
+
+.ifconfig_do
+
+; Check for absence of arguments
+
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	z, ifconfig_syntax
+
+; Check for switch character
+
+cp	SWITCH
+jr	z, ifconfig_show		; Note C is clear too
+
+; Get IP address
+
+ld	de, ifconfig_newip
+call	util_readdottedquad
+jp	nz, ifconfig_badaddress
+
+; Copy IP address
+
+push	hl
+ld	hl, ifconfig_newip
+ld	de, config_hostaddr
+ld	bc, 4
+ldir
+scf
+pop	hl
+dec	hl
+
+.ifconfig_show
+
+inc	hl
+push	hl
+call	printstringimm
+defb	"This host's IP address is ", 0
+ld	hl, ifconfig_shownow
+call	c, printstring
+ld	hl, config_hostaddr
+call	printipaddr
+call	printcrlf
+pop	hl
+
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	z, ifconfig_shownameserver
+
+; Get IP address
+
+ld	de, ifconfig_newip
+call	util_readdottedquad
+jr	nz, ifconfig_badnameserveraddress
+
+; Copy IP address
+
+ld	hl, ifconfig_newip
+ld	de, config_nameserveraddr
+ld	bc, 4
+ldir
+scf
+
+.ifconfig_shownameserver
+
+call	printstringimm
+defb	"The name server's IP address is ", 0
+ld	hl, ifconfig_shownow
+call	c, printstring
+ld	hl, config_nameserveraddr
+call	printipaddr
+call	printcrlf
+
+jp	keyb_client_done
+
+
+.ifconfig_shownow
+
+defb	"now ", 0
+
+
+.ifconfig_newip
+
+defs	4
+
+
+.ifconfig_badaddress
+
+call	printstringimm
+defb	"Bad host address", CR, LF, 0
+jp	keyb_client_done
+
+.ifconfig_badnameserveraddress
+
+call	printstringimm
+defb	"Bad name server address", CR, LF, 0
+jp	keyb_client_done

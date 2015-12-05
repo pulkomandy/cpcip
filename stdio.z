@@ -1,0 +1,779 @@
+; CPC/IP standard I/O library
+; Copyright (c) 2000 Mark RISON
+
+; A standard I/O library must export the following routines
+; (the entry/exit conditions are described here at the top of each):
+; stdio_init, stdio_final, TXT_OUTPUT, TXT_WR_CHAR, TXT_GET_CURSOR,
+; TXT_CUR_ON, TXT_CUR_OFF, KM_READ_CHAR, KL_TIME_PLEASE,
+; FILE_IN_OPEN, FILE_IN_CHAR, FILE_IN_BLOCK, FILE_IN_CLOSE,
+; FILE_OUT_OPEN, FILE_OUT_CHAR, FILE_OUT_BLOCK, FILE_OUT_CLOSE,
+; TFTPD_GET_ERROR [if TFTPD defined]
+;
+; A standard I/O library must export the following symbols:
+; CTRL_C, CTRL_E, HCR, HESC, KICH1, KDCH1, KTOGGLE, KQUIT,
+; KCUU1, KCUD1, KCUB1, KCUF1, KPP, KNP, KHOME, KEND,
+; FILE_EOF, FILE_NOT_FOUND
+;
+; A standard I/O library may expect the following imported symbols:
+; NUL, BEL, BS, TAB, LF, CR, ESC, DEL
+
+
+.stdio_init
+
+; Initialise the standard I/O library
+;
+; On exit:
+;	AF, BC, DE, HL may be corrupted
+;
+; Interrupts may be enabled.
+
+KM_SET_TRANSLATE equ	&bb27
+KM_SET_CONTROL	equ	&bb33
+KL_FIND_COMMAND	equ	&bcd4
+KL_FAR_PCHL	equ	&001b
+
+; Disable disc error messages
+
+ld	hl, amsdos_set_message
+call	KL_FIND_COMMAND
+
+ld	a, &ff			; Disable prompting
+call	c, KL_FAR_PCHL
+ld	(amsdos_message_previous), a
+
+; Twiddle a few key codes
+
+ld	a, 66
+ld	b, ESC
+call	KM_SET_TRANSLATE
+ld	a, 17
+ld	b, HESC
+call	KM_SET_CONTROL
+ld	a, 6
+ld	b, HCR
+call	KM_SET_TRANSLATE
+ld	a, 16
+ld	b, HDLE
+jp	KM_SET_TRANSLATE
+
+.amsdos_set_message
+
+defb	&81			; BIOS SET MESSAGE
+
+.amsdos_message_previous
+
+defs	1
+
+
+.TXT_OUTPUT
+
+; Output a character or control code
+;
+; On entry:
+;	A = code
+;
+; On exit:
+;	All regs preserved
+;
+; ASCII printables (codes &20 to &7e) should be output at the current
+; cursor position, overwriting any existing character; the current
+; cursor position should be moved forward one position.
+;
+; ASCII NUL should be ignored.
+;
+; ASCII BEL should preferably cause an audible or visible bell,
+; but may be ignored if this is not possible.  The cursor position
+; should not be moved, nor should any character be overwritten.
+;
+; ASCII BS should cause the current cursor position to be moved
+; backward one position.  No character should be overwritten.
+;
+; ASCII TAB should cause the current cursor position to be moved
+; forward one position.  No character should be overwritten.
+;
+; ASCII LF should cause the current cursor position to be moved
+; downwards one line.  No character should be overwritten.
+;
+; ASCII CR should cause the current cursor position to be moved
+; to the start of the current line.  No characters should be overwritten.
+;
+; All other codes have undefined effects, and should only be used
+; in implementation-specific components (such as telnet's console).
+;
+; If the cursor ends up past the end of the current line, then
+; it should wrap around to the next line.  If the cursor was
+; on the bottom line, then scrolling should take place, but it
+; it is permissible to delay this scrolling until another character
+; is printed.  Similar considerations apply if the cursor ends up
+; before the beginning of the current line.
+
+TXT_OUTPUT_	equ	&bb5a
+
+push	af
+
+cp	'^'			; I really hate the CPC's 'hat'
+jr	nz, txt_output_nothat
+
+ld	a, &a0			; That's better!
+
+.txt_output_nothat
+
+call	TXT_OUTPUT_
+
+pop	af
+ret
+
+
+.TXT_WR_CHAR
+
+; Output a character
+;
+; On entry:
+;	A = code
+;
+; On exit:
+;	AF, BC, DE, HL corrupt
+;
+; ASCII printables (codes &20 to &7e) should be output at the current
+; cursor position, overwriting any existing character; the current
+; cursor position should be moved forward one position.
+;
+; All other codes should behave in the same way, but the appearance
+; of the character output is undefined; this may be useful
+; in implementation-specific components (such as telnet's console),
+; or to protect against malicious control codes from external sources.
+;
+; If the cursor ends up past the end of the current line, then
+; it should wrap around to the next line.  If the cursor was
+; on the bottom line, then scrolling should take place, but it
+; it is permissible to delay this scrolling until another character
+; is printed.
+
+TXT_WR_CHAR_	equ	&bb5d
+
+cp	'^'			; I really hate the CPC's 'hat'
+jp	nz, TXT_WR_CHAR_
+ld	a, &a0			; That's better!
+jp	TXT_WR_CHAR_
+
+
+.TXT_GET_CURSOR
+
+; Get current cursor position
+;
+; On exit:
+;	A = column
+;	H = column
+;	L = row
+;	F corrupt
+;
+; The leftmost column is column 0 and the topmost row is row 0.
+
+TXT_GET_CURSOR_	equ	&bb78
+
+call	TXT_GET_CURSOR_
+dec	h
+dec	l
+ld	a, h
+ret
+
+
+.TXT_CUR_ON
+
+; Turn the cursor on
+;
+; On exit:
+;	All regs preserved
+;
+; Make the current cursor position visible to the user, if possible.
+; This may slow character output.
+;
+; Requests to turn the cursor on do not nest.
+; The initial state of cursor visibility is undefined.
+
+TXT_CUR_ON_	equ	&bb81
+
+jp	TXT_CUR_ON_
+
+
+.TXT_CUR_OFF
+
+; Turn the cursor off
+;
+; On exit:
+;	All regs preserved
+;
+; Stop the current cursor position from being visible to the user, if possible.
+; This may speed up character output.
+;
+; Requests to turn the cursor off do not nest.
+; The initial state of cursor visibility is undefined.
+
+TXT_CUR_OFF_	equ	&bb84
+
+jp	TXT_CUR_OFF_
+
+
+CTRL_C		equ	3
+CTRL_E		equ	5
+HCR		equ	13 + &a0
+HDLE		equ	16 + &a0
+HESC		equ	27 + &a0
+COPY		equ	&e0
+INS		equ	&e1
+UP		equ	&f0
+DOWN		equ	&f1
+LEFT		equ	&f2
+RIGHT		equ	&f3
+SHIFT_UP	equ	&f4
+SHIFT_DOWN	equ	&f5
+SHIFT_LEFT	equ	&f6
+SHIFT_RIGHT	equ	&f7
+CTRL_UP		equ	&f8
+CTRL_DOWN	equ	&f9
+CTRL_LEFT	equ	&fa
+CTRL_RIGHT	equ	&fb
+BREAK		equ	&fc
+
+KCUB1		equ	LEFT
+KCUD1		equ	DOWN
+KCUF1		equ	RIGHT
+KCUU1		equ	UP
+KHOME		equ	CTRL_LEFT
+KICH1		equ	INS
+KDCH1		equ	HDLE
+KEND		equ	CTRL_RIGHT
+KPP		equ	CTRL_UP
+KNP		equ	CTRL_DOWN
+KQUIT		equ	BREAK
+KTOGGLE		equ	COPY
+
+
+.KM_READ_CHAR
+
+; Get a character from the keyboard buffer, if available
+;
+; On exit:
+;	If character available, Carry set and A = code
+;	If character not available, Carry clear and A corrupt
+;	Other flags corrupt
+;
+; It should be possible to enter all ASCII characters (codes &00 to &7f)
+; from the keyboard.  It may be possible to enter other characters.
+;
+; CR should be returned for the Enter/Return key.  It should be
+; possible to enter a carriage return code by a separate key (or key
+; combination); HCR should be returned for this.
+;
+; DEL should be returned for the Delete/Backspace key.  If there
+; is a Delete/Clear key, KDCH1 should be returned for it.  If there
+; is an Insert key, KICH1 should be returned for it.
+;
+; If any of HCR, KDCH1 or KICH1 isn't available then an impossible-to-enter
+; character code should be defined for them.
+;
+; HESC should be returned for ^[; this should be distinct from the
+; ESC which should be returned for the Escape key.  CTRL_C should
+; be returned for ^C and CTRL_E for ^E.
+;
+; KTOGGLE should be returned for a key which can be used as a
+; datalink toggle.  KQUIT should be returned for a key which can
+; be used to exit CPC/IP.
+;
+; KCUU1/KCUD1/KCUB1/KCUF1 should be returned for the UP/DOWN/LEFT/RIGHT
+; cursor/arrow keys.  KPP/KNP/KHOME/KEND should be returned for
+; PREVPAGE/NEXTPAGE/HOME/END (typically as CTRL_UP/DOWN/LEFT/RIGHT).
+
+KM_READ_CHAR_	equ	&bb09
+
+jp	KM_READ_CHAR_
+
+
+.FILE_IN_OPEN
+
+; Open a file for input
+;
+; On entry:
+;	HL -> filename
+;	B = length of filename
+;
+; On exit:
+;	A = corrupted iff success, otherwise status code
+;	HL = handle iff success, otherwise corrupted
+;	Carry set iff success
+;	BC, DE and other flags corrupted
+;
+; Note the filename does not include any terminator.
+
+CAS_IN_OPEN	equ	&bc77
+
+ld	de, amsdosreadbuf
+push	ix
+ld	ix, CAS_IN_OPEN
+call	amsdos_quietcall
+pop	ix
+
+jr	nc, amsdos_decodeerrors
+
+and	&0e
+ld	(amsdos_ftype), a
+scf
+ret
+
+.amsdos_ftype
+
+defs	1
+
+
+.FILE_IN_CHAR
+
+; Read a character from an input file
+;
+; On entry:
+;	HL = handle
+;
+; On exit:
+;	A = character iff success, otherwise status code
+;	Carry set iff success
+;	Other flags corrupted
+
+CAS_IN_CHAR	equ	&bc80
+
+push	ix
+ld	ix, CAS_IN_CHAR
+call	amsdos_quietcall
+pop	ix
+
+jr	amsdos_decodeerrors
+
+
+.FILE_IN_BLOCK
+
+; Read a block of characters from an input file
+;
+; On entry:
+;	HL = handle
+;	DE = block pointer
+;	BC = block size
+;
+; On exit:
+;	BC = number of characters not read
+;	A = corrupt iff success, otherwise status code
+;	Carry set iff success
+;	DE and other flags corrupted
+
+call	FILE_IN_CHAR
+ret	nc
+
+ld	(de), a
+inc	de
+
+dec	bc
+ld	a, b
+or	c
+jr	nz, FILE_IN_BLOCK
+
+scf
+ret
+
+
+.FILE_IN_CLOSE
+
+; Close an input file
+;
+; On entry:
+;	HL = handle
+;
+; On exit:
+;	A = corrupted iff success, otherwise status code
+;	Carry set iff success
+;	BC, DE, HL and other flags corrupted
+;
+; Note the file is always closed, even on failure.
+
+CAS_IN_CLOSE	equ	&bc7a
+CAS_IN_ABANDON	equ	&bc7d
+
+push	ix
+ld	ix, CAS_IN_CLOSE
+call	amsdos_quietcall
+push	af
+ld	ix, CAS_IN_ABANDON	; Just to be sure (AMSDOS bugs...)!
+call	amsdos_quietcall
+pop	af
+pop	ix
+
+jr	amsdos_decodeerrors
+
+
+.FILE_OUT_OPEN
+
+; Open a file for output
+;
+; On entry:
+;	HL -> filename
+;	B = length of filename
+;
+; On exit:
+;	A = corrupted iff success, otherwise status code
+;	HL = handle iff success, otherwise corrupted
+;	Carry set iff success
+;	BC, DE and other flags corrupted
+;
+; Note the filename does not include any terminator.
+
+CAS_OUT_OPEN	equ	&bc8c
+
+ld	de, amsdoswritebuf
+push	ix
+ld	ix, CAS_OUT_OPEN
+call	amsdos_quietcall
+pop	ix
+
+jr	amsdos_decodeerrors
+
+
+.FILE_OUT_CHAR
+
+; Write a character to an output file
+;
+; On entry:
+;	A = character
+;	HL = handle
+;
+; On exit:
+;	A = corrupt iff success, otherwise status code
+;	Carry set iff success
+;	Other flags corrupted
+
+CAS_OUT_CHAR	equ	&bc95
+
+push	ix
+ld	ix, CAS_OUT_CHAR
+call	amsdos_quietcall
+pop	ix
+
+jr	amsdos_decodeerrors
+
+
+.FILE_OUT_BLOCK
+
+; Write a block of characters to an output file
+;
+; On entry:
+;	HL = handle
+;	DE = block pointer
+;	BC = block size
+;
+; On exit:
+;	BC = number of characters not written
+;	A = corrupt iff success, otherwise status code
+;	Carry set iff success
+;	DE and other flags corrupted
+
+ld	a, (de)
+call	FILE_OUT_CHAR
+ret	nc
+
+inc	de
+
+dec	bc
+ld	a, b
+or	c
+jr	nz, FILE_OUT_BLOCK
+
+scf
+ret
+
+
+.FILE_OUT_CLOSE
+
+; Close an input file
+;
+; On entry:
+;	HL = handle
+;
+; On exit:
+;	A = corrupted iff success, otherwise status code
+;	Carry set iff success
+;	BC, DE, HL and other flags corrupted
+;
+; Note the file is always closed, even on failure.
+
+CAS_OUT_CLOSE	equ	&bc8f
+CAS_OUT_ABANDON	equ	&bc92
+
+push	ix
+ld	ix, CAS_OUT_CLOSE
+call	amsdos_quietcall
+push	af
+ld	ix, CAS_OUT_ABANDON	; Just to be sure (AMSDOS bug with R/O discs)!
+call	amsdos_quietcall
+pop	af
+pop	ix
+
+jr	amsdos_decodeerrors
+
+
+.amsdos_decodeerrors
+
+ret	c
+
+res	7, a			; Clear the "already reported" bit
+
+cp	&1a			; Soft EOF (aargh!)
+jr	nz, amsdos_notsoftEOF	; Assume this will only happen for CAS_IN_CHAR!
+
+ld	a, (amsdos_ftype)
+cp	6
+scf
+ld	a, &1a
+ret	nz			; If not ASCII file, transform into valid char
+ld	a, &0f			; Else transform into hard EOF
+
+.amsdos_notsoftEOF
+
+or	a			; Escape
+ret	z
+
+cp	&09			; Disc changed appears not to be &15
+jr	nz, amsdos_notstrangechange ; as per Soft 968 but &09
+ld	a, &15
+
+.amsdos_notstrangechange
+
+cp	&0e			; Min error code is &0e
+jr	nc, amsdos_notunknown1
+
+ld	a, &0a			; Anything below that mapped to &0a
+
+.amsdos_notunknown1
+
+bit	6, a
+jr	z, amsdos_notfdcerror
+
+bit	3, a
+jr	z, amsdos_notdiscmissing
+
+ld	a, &0c			; Disc missing mapped to &0c
+jr	amsdos_wasdiscmissing
+
+.amsdos_notdiscmissing
+
+bit	1, a
+ld	a, &0d			; Disc R/O mapped to &0d
+jr	nz, amsdos_wasdiscro
+
+ld	a, &0b			; Misc FDC error mapped to &0b
+
+.amsdos_wasdiscmissing
+.amsdos_wasdiscro
+.amsdos_notfdcerror
+
+cp	&10			; Another bug work-around...
+jr	nz, amsdos_noneedtodetermineifdiscmissing
+
+push	bc
+push	de
+push	hl
+push	ix
+push	iy
+
+ld	hl, amsdos_get_dr_status
+call	KL_FIND_COMMAND
+jr	nc, amsdos_determinehuh
+
+AMSDOS_DRIVE	equ	&a700	; FIXME check
+ld	a, (AMSDOS_DRIVE)
+call	KL_FAR_PCHL
+jr	c, amsdos_nofiddlefaffle
+
+inc	hl
+ld	a, (hl)
+
+.amsdos_nofiddlefaffle
+
+bit	5, a
+ld	a, &0c			; Disc missing mapped to &0c
+jr	z, amsdos_determinedone
+
+.amsdos_determinehuh
+
+ld	a, &10			; Otherwise it looks like a bad filename
+
+.amsdos_determinedone
+
+pop	iy
+pop	ix
+pop	hl
+pop	de
+pop	bc
+
+.amsdos_noneedtodetermineifdiscmissing
+
+cp	&17			; Max error code is &16
+jr	c, amsdos_notunknown2
+ld	a, &0a			; Anything above that mapped to &0a
+
+.amsdos_notunknown2
+
+sub	&0b - &02		; So misc FDC remapped to 2, etc.
+or	a			; Carry clear
+
+ret
+
+.amsdos_get_dr_status
+
+defb	&88			; BIOS GET DR STATUS
+
+
+; So, this is what it's all supposed to boil down to:
+;  0 - Escape pressed
+;  1 - Unknown error!
+;  2 - Hard FDC error
+;  3 - Disc missing
+;  4 - Disc read-only
+;  5 - File not open as expected
+;  6 - EOF met
+FILE_EOF	equ	6
+;  7 - Bad filename
+;  8 - File already exists
+;  9 - File doesn't exist
+FILE_NOT_FOUND	equ	9
+; 10 - Directory full
+; 11 - Disc full
+; 12 - Disc changed
+; 13 - File read-only
+
+
+.amsdos_quietcall
+
+; Use with IX = CAS_*, and AMSDOS is prevented from making
+; a spectacle (e.g. it will normally print out "Bad command" if no
+; disc is present, even if messages have been disabled).
+; This routine should only be used if AMSDOS messages have been
+; disabled (sic).
+
+push	af
+ld	a, (TXT_OUTPUT_)	; Get original opcode at TXT_OUTPUT
+ld	(amsdos_quietcall_txtoutputorig), a
+ld	a, &c9			; Patch to RET
+ld	(TXT_OUTPUT_), a
+pop	af
+
+call	callix
+
+push	af
+ld	a, (amsdos_quietcall_txtoutputorig)
+ld	(TXT_OUTPUT_), a	; Restore (was almost certainly RST 1)
+pop	af
+
+ret
+
+.amsdos_quietcall_txtoutputorig
+
+defb	1
+
+
+if	TFTPD
+
+.TFTPD_GET_ERROR
+
+; Get the TFTPD error code and string corresponding to a FILE_* status code
+;
+; On entry:
+;	A = status code
+;
+; On exit:
+;	A = TFTP error code
+;	HL -> error string
+;	F corrupted
+
+ld	hl, tftpd_get_error_errors
+or	a
+jr	z, tftpd_get_error_first
+
+.tftpd_get_error_finderror
+
+inc	hl
+call	strend
+dec	a
+jr	nz, tftpd_get_error_finderror
+
+.tftpd_get_error_first
+
+ld	a, (hl)
+dec	a
+inc	hl
+
+ret
+
+.tftpd_get_error_errors		; Error code incremented so no confusing NULs
+
+defb	0 + 1, "Escape pressed", 0
+defb	0 + 1, "Unknown error!", 0
+defb	0 + 1, "Hard FDC error", 0
+defb	2 + 1, "Disc missing", 0
+defb	2 + 1, "Disc read-only", 0
+defb	0 + 1, "File not open as expected", 0
+defb	0 + 1, "EOF met", 0
+defb	2 + 1, "Bad filename", 0
+defb	6 + 1, "File already exists", 0
+defb	1 + 1, "File doesn't exist", 0
+defb	3 + 1, "Directory full", 0
+defb	3 + 1, "Disc full", 0
+defb	0 + 1, "Disc changed", 0
+defb	2 + 1, "File read-only", 0
+
+endif
+
+
+.KL_TIME_PLEASE
+
+; Get the elapsed time
+;
+; On exit:
+;	DEHL contains the time in 1/300 s (MSB in D)
+;
+; The time is zeroed at reset.
+;
+; Interrupts may be enabled.
+
+KL_TIME_PLEASE_	equ	&bd0d
+
+jp	KL_TIME_PLEASE_
+
+
+.stdio_final
+
+; Finalise the standard I/O library
+;
+; On exit:
+;	AF, BC, DE, HL may be corrupted
+;
+; Interrupts may be enabled.
+
+KM_INITIALISE	equ	&bb00
+KM_SCAN_KEYS	equ	&bdf4
+
+; Restore disc error messages
+
+ld	hl, amsdos_set_message
+call	KL_FIND_COMMAND
+
+ld	a, (amsdos_message_previous)
+call	c, KL_FAR_PCHL
+
+; Restore the key codes
+
+ld	a, (KM_SCAN_KEYS)	; Preserve any screen saver...
+ld	hl, (KM_SCAN_KEYS + 1)
+push	af
+push	hl
+call	KM_INITIALISE
+pop	hl
+pop	af
+ld	(KM_SCAN_KEYS), a
+ld	(KM_SCAN_KEYS + 1), hl
+
+ret

@@ -1,0 +1,230 @@
+; CPC/IP UDP layer
+; Copyright (c) 1999-2001 Mark RISON
+
+; The UDP layer exports the following routines
+; (the entry/exit conditions are described here at the top of each):
+; udp_bind, udp_close
+
+
+UDP_SRC1	equ	0
+UDP_SRC0	equ	1
+
+UDP_DST1	equ	2
+UDP_DST0	equ	3
+
+UDP_LEN1	equ	4
+UDP_LEN0	equ	5
+
+UDP_CSM1	equ	6
+UDP_CSM0	equ	7
+
+UDP_HDRSIZE	equ	8
+
+
+.udp_
+
+; The minimal UDP datagram size is 8
+
+push	hl
+ld	hl, -UDP_HDRSIZE
+add	hl, de
+pop	hl
+jp	nc, udp_toosmall
+
+; Does the received datagram size match the declared size?
+
+push	hl
+ld	h, (iy + UDP_LEN1)
+ld	l, (iy + UDP_LEN0)
+or	a
+sbc	hl, de
+pop	hl
+jp	nz, udp_sizemismatch
+
+; Is there a checksum?  If so, check it
+
+ld	a, (iy + UDP_CSM1)
+or	(iy + UDP_CSM0)
+
+push	de
+call	nz, cs_calcudpchecksum
+jp	nz, udp_badchecksum
+pop	de
+
+; It's looking good!
+
+if	SHOW_INFO
+call	udp_showinfo
+endif
+
+; Go through UDP bind list looking for match
+
+push	hl
+ld	hl, (udp_client_head)
+call	ucp_dispatch
+pop	hl
+
+; Too bad...
+
+if	SHOW_ERROR
+
+call	printstringimm
+defb	"UDP: datagram on unbound local port ", 0
+ld	h, (iy + UDP_DST1)
+ld	l, (iy + UDP_DST0)
+call	printdec2
+call	printstringimm
+defb	" (or remote ", 0
+push	ix
+pop	hl
+ld	bc, IP_SRC3
+add	hl, bc
+call	printipaddr
+call	printstringimm
+defb	':', 0
+ld	h, (iy + UDP_SRC1)
+ld	l, (iy + UDP_SRC0)
+call	printdec2
+call	printstringimm
+defb	" rejected)", CR, LF, 0
+
+endif
+
+ld	a, ICMP_PORT_UNREACH
+call	icmp_senddestunreach
+
+.udp_done
+
+ret
+
+
+.udp_client_head
+
+defw	0
+
+
+.udp_bind
+
+; UDP bind
+;
+; On entry:
+;	HL -> bind structure
+;
+; On exit:
+;	All regs preserved
+;
+; Note no check is made that the given bind structure isn't already
+; on the bind list -- ensure this doesn't happen!
+;
+; The bind structure is:
+;	word	next		(system-maintained; don't ever write to it)
+;	dword	remaddr		(big-endian)
+;	word	remport		(big-endian)
+;	word	locport		(big-endian)
+;	word	handler		(little-endian)
+;
+; The first octet of the remaddr and the two octets of the remport
+; may independently be set to all-zeroes to mean "any".
+; The octets of the remaddr and the remport may all be set to
+; all-ones to mean "none" (effectively temporarily suspending the UDP bind).
+
+push	ix
+push	de
+ld	ix, udp_client_head
+call	ll_insert
+pop	de
+pop	ix
+
+ret
+
+
+.udp_close
+
+; UDP close
+;
+; On entry:
+;	HL -> bind structure
+;
+; On exit:
+;	All regs preserved
+;
+; Note if the structure isn't on the bind list, nothing happens.
+
+push	ix
+ld	ix, udp_client_head
+call	ll_remove
+pop	ix
+
+ret
+
+
+if	SHOW_ERROR
+
+.udp_badchecksum
+
+call	printstringimm
+defb	"UDP: bad checksum: &", 0
+pop	hl
+ex	de, hl
+jp	printhex2crlf
+
+.udp_toosmall
+
+call	printstringimm
+defb	"UDP: datagram too small: ", 0
+ld	a, e
+call	printdec
+jp	printcrlf
+
+.udp_sizemismatch
+
+call	printstringimm
+defb	"UDP: datagram size mismatch: declared &",0
+ld	h, (iy + UDP_LEN1)
+ld	l, (iy + UDP_LEN0)
+call	printhex2
+call	printstringimm
+defb	" vs. actual &", 0
+ex	de, hl
+jp	printhex2crlf
+
+else
+
+udp_badchecksum		equ	udp_done
+udp_toosmall		equ	udp_done
+udp_sizemismatch	equ	udp_done
+
+endif
+
+
+if	SHOW_INFO
+
+.udp_showinfo
+
+push	hl
+
+call	printstringimm
+defb	"UDP: datagram size: &", 0
+ld	h, (iy + UDP_LEN1)
+ld	l, (iy + UDP_LEN0)
+call	printhex2crlf
+
+call	printstringimm
+defb	"UDP: source port: ", 0
+ld	h, (iy + UDP_SRC1)
+ld	l, (iy + UDP_SRC0)
+call	printdec2
+call	printcrlf
+
+call	printstringimm
+defb	"UDP: dest port:   ", 0
+ld	h, (iy + UDP_DST1)
+ld	l, (iy + UDP_DST0)
+call	printdec2
+call	printcrlf
+
+pop	hl
+
+ret
+
+endif

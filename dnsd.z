@@ -1,0 +1,641 @@
+; CPC/IP DNS server
+; Copyright (c) 1999-2000 Mark RISON
+
+
+.dns_init
+
+call	printstringimm
+defb	"DNS server initialised", CR, LF, 0
+
+; Set up UDP bindings for DNS
+
+ld	hl, dns_server_bind
+jp	udp_bind
+
+
+.dns_server_bind
+
+defs	2			; Linked-list link
+defb	0, 0, 0, 0		; Any remote address
+defb	0, 0			; Any remote port
+defb	0, UDP_DNS		; Local port
+defw	dns_request		; Handler
+
+
+.dns_request
+
+; UDP DNS datagrams have at least 8 (UDP) + 12 (DNS header) +
+; 1 (QNAME) + 2 (QTYPE) + 2 (QCLASS) = 25 octets
+
+push	hl
+ld	hl, -25
+add	hl, de
+pop	hl
+jp	nc, dns_toosmall
+
+; Make sure query is acceptable
+
+ld	a, (iy + DNS_QFLAGS)
+and	DNS_QR or DNS_OPCODE or DNS_TC
+cp	DNS_QUERY
+jp	nz, dns_badquery
+
+; Make sure query contains just one question and no responses
+
+ld	a, (iy + DNS_QDCOUNT0)
+dec	a
+or	(iy + DNS_QDCOUNT1)
+or	(iy + DNS_ANCOUNT1)
+or	(iy + DNS_ANCOUNT0)
+or	(iy + DNS_NSCOUNT1)
+or	(iy + DNS_NSCOUNT0)
+or	(iy + DNS_ARCOUNT1)
+or	(iy + DNS_ARCOUNT0)
+jp	nz, dns_badquestion
+
+; Sanity-check the QNAME
+
+push	de
+push	hl
+
+push	iy
+pop	hl
+
+ld	bc, DNS_QNAME
+add	hl, bc
+ex	de, hl			; DE -> question
+
+push	de
+
+ld	bc, 24			; C cleared from ADD above
+sbc	hl, bc			; HL = expected number of QNAME octets
+
+.dns_check_loop
+
+ld	a, (de)			; A = label length
+cp	&40			; FIXME pointers/compression not supported
+jp	nc, dns_badlabel
+
+inc	a			; Need to include length octet
+ld	b, 0
+ld	c, a
+or	a
+sbc	hl, bc
+jp	c, dns_badname		; We've overrun
+
+ex	de, hl
+add	hl, bc			; Wind along QNAME, as pointed to by DE
+ex	de, hl
+dec	a			; Hit root label?
+jr	nz, dns_check_loop
+
+ld	a, h			; Should have used up the octets
+or	l
+jp	nz, dns_badname		; We've underrun
+
+ex	de, hl			; HL -> QTYPE
+pop	de			; DE -> question
+
+; It's looking good!
+
+if	SHOW_INFO
+call	dns_showinfo
+endif
+
+; Squirrel away QTYPE and QCLASS
+
+ld	b, (hl)
+inc	hl
+ld	c, (hl)
+inc	hl
+ld	(dns_requested_qtype), bc
+ld	b, (hl)
+inc	hl
+ld	c, (hl)
+inc	hl
+ld	(dns_requested_qclass), bc
+push	hl			; SP -> end of question + 1
+				; = start of answer section
+
+ld	hl, (config_dns_resourcerecords)
+
+; Look for answers
+
+.dns_match
+
+call	dns_lookup_trynext
+jr	nc, dns_notfound
+
+ex	de, hl			; DE -> answer to add
+				; HL -> question
+ex	(sp), hl		; SP -> question
+				; HL -> end of answer section + 1
+ex	de, hl			; DE -> end of answer section + 1
+				; HL -> answer to add
+
+.dns_copyanswer_name
+
+ld	a, (hl)			; FIXME you're supposed to keep the case...
+inc	hl
+ld	(de), a
+inc	de
+or	a
+jr	nz, dns_copyanswer_name
+
+ld	bc, 2 + 2 + 4 + 2	; TYPE, CLASS, TTL, RDLENGTH
+ldir
+
+dec	hl
+ld	c, (hl)
+dec	hl
+ld	b, (hl)
+inc	hl
+inc	hl
+ldir				; HL -> next RR to match against
+				; DE -> end of answer section + 1
+ex	de, hl			; HL -> end of answer section + 1
+				; DE -> next RR to match against
+ex	(sp), hl		; SP -> end of answer section + 1
+				; HL -> question
+ex	de, hl			; DE -> question
+				; HL -> next RR to match against
+
+inc	(iy + DNS_ANCOUNT0)
+
+jr	dns_match
+
+.dns_notfound
+
+push	iy			; Compute length
+pop	de			; FIXME check for overflow and set TC bit
+pop	hl
+xor	a
+ld	(hl), a			; For checksums of odd-length datagrams
+sbc	hl, de
+ld	b, h
+ld	c, l
+
+call	ip_swapsrcdest
+call	ucp_swapsrcdest
+
+pop	hl
+pop	de
+
+ld	(iy + UDP_LEN1), b
+ld	(iy + UDP_LEN0), c
+ld	a, (iy + DNS_QFLAGS)
+and	DNS_OPCODE or DNS_RD
+or	DNS_QR or DNS_AA		;; FIXME: not AA if QCLASS='*' used?
+ld	(iy + DNS_QFLAGS), a		;; FIXME: not AA if failed to match
+ld	(iy + DNS_RFLAGS), DNS_NOERR	;; FIXME  unless in our zone
+call	cs_setudpchecksum
+
+call	cs_setlengthandchecksum
+jp	slip_sendpacket
+
+
+.dns_lookup_trynext
+
+; On entry:
+;	DE -> record to look for
+;	HL -> next RR to match against (initialise with dns_resourcerecords)
+; On exit:
+;	AF, BC corrupted
+;	C set if match, and if so,
+;	HL -> record matched against, else HL corrupted
+
+; FIXME pointers/compression not supported
+
+push	de
+push	hl
+
+.dns_lookup_loop
+
+ld	a, (de)
+inc	de
+call	tolower
+cp	(hl)
+jr	nz, dns_lookup_notthisone
+inc	hl
+or	a
+jr	nz, dns_lookup_loop
+
+; Found a QNAME match
+
+inc	hl
+inc	hl			; HL -> CLASS of candidate RR
+push	hl
+
+; Check for QCLASS match
+
+ld	bc, (dns_requested_qclass)	; Check for QCLASS = 255 = *
+ld	a, c
+inc	a
+or	b
+jr	z, dns_wild_qclass
+
+inc	hl
+ld	e, (hl)			; Check for QCLASS = CLASS
+dec	hl
+ld	d, (hl)
+ex	de, hl			; HL = CLASS of candidate RR
+sbc	hl, bc			; C clear from OR B above
+ex	de, hl			; HL -> CLASS of candidate RR
+jr	nz, dns_lookup_notthisoneafterall
+
+.dns_wild_qclass
+
+; Check for QTYPE match
+
+ld	bc, (dns_requested_qtype)	; Check for QTYPE = 255 = *
+ld	a, c
+inc	a
+or	b
+jr	z, dns_wild_type
+
+dec	hl			; Check for QTYPE = TYPE
+ld	e, (hl)
+dec	hl
+ld	d, (hl)
+ex	de, hl			; HL = TYPE of candidate RR
+sbc	hl, bc			; C clear from OR B above
+;ex	de, hl
+jr	z, dns_matched_type
+
+; TYPE doesn't match the QTYPE, but is it a CNAME by any chance?
+
+;ex	de, hl			; Check for TYPE = CNAME
+add	hl, bc			; HL = TYPE of candidate RR
+ld	bc, DNS_CNAME
+or	a
+sbc	hl, bc
+;ex	de, hl
+jr	nz, dns_lookup_notthisoneafterall
+
+; It's a CNAME!  Continue search with the CNAME
+
+pop	hl			; For the PUSH HL at dns_lookup_loop
+pop	hl			; For the PUSH HL at dns_lookup_trynext
+pop	de			; For the PUSH DE at dns_lookup_trynext
+ld	d, h			; Munge record to look for (pointed by DE)
+ld	e, l			; so that retry using CNAME
+call	strend
+ld	bc, 2 + 2 + 4 + 2	; TYPE, CLASS, TTL, RDLENGTH
+add	hl, bc
+ex	de, hl
+jr	dns_cname_type
+
+.dns_wild_type
+.dns_matched_type
+
+pop	hl			; For the PUSH HL at dns_lookup_loop
+pop	hl			; For the PUSH HL at dns_lookup_trynext
+pop	de			; For the PUSH DE at dns_lookup_trynext
+
+.dns_cname_type
+
+if	SHOW_INFO
+call	printstringimm
+defb	"DNS: found match", CR, LF, 0
+endif
+
+scf
+
+ret
+
+.dns_lookup_notthisoneafterall
+
+pop	hl			; For the PUSH HL at dns_lookup_loop
+jr	dns_lookup_notthisonedone2
+
+.dns_lookup_notthisone
+
+xor	a			; Skip to end of NAME of candidate RR
+cp	(hl)
+jr	z, dns_lookup_notthisonedone
+
+.dns_lookup_notthisone_loop
+
+ld	a, (hl)
+inc	hl
+or	a
+jr	nz, dns_lookup_notthisone_loop
+
+.dns_lookup_notthisonedone
+
+inc	hl			; Skip TYPE word
+inc	hl
+
+.dns_lookup_notthisonedone2
+
+inc	hl			; Skip CLASS word
+inc	hl
+
+inc	hl			; Skip TTL
+inc	hl
+inc	hl
+inc	hl
+ld	d, (hl)			; Get RDLENGTH
+inc	hl
+ld	e, (hl)
+inc	hl
+add	hl, de			; Skip RDATA
+
+ld	a, (hl)
+or	a
+pop	de			; For the PUSH HL at dns_lookup_trynext
+pop	de			; Restore the entry DE
+jp	nz, dns_lookup_trynext
+
+if	SHOW_INFO
+call	printstringimm
+defb	"DNS: no match", CR, LF, 0
+endif
+
+scf
+ccf
+
+ret
+
+.dns_requested_qclass
+
+defs	2
+
+.dns_requested_qtype
+
+defs	2
+
+
+.dns_resourcerecords
+
+; Format is a set of RRs, terminated with a zero byte
+; Each RR has the following format:
+; - NAME in lower-case (NUL-terminated because of root domain)
+; - TYPE, big-endian word
+; - CLASS, big-endian word
+; - TTL, big-endian dword
+; - RDLENGTH, big-endian word
+; - RDATA, of length RDLENGTH
+; If a CNAME RR is present, no other RRs should be present for that NAME
+; The CNAMEs should be before the NAMEs they point to
+; No safety-checking; get anything wrong and it blows up!
+
+; DNS RRs for bufo-house.org
+
+; bufo-house.org; SOA, TXT, NS, PTR
+
+defb	10, "bufo-house", 3, "org", 0
+defb	0, DNS_SOA
+defb	0, DNS_IN
+defb	0, 0, 0, 0
+dns_longone	equ	dns_longone2 - dns_longone1
+defb	dns_longone / 256, dns_longone and &ff
+.dns_longone1
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0	; MNAME
+defb	6, "mrison", 7, "hotmail", 3, "com", 0		; RNAME
+defb	0, 0, 0, 0					; SERIAL
+defb	0, 0, 0, 10					; REFRESH
+defb	0, 0, 0, 10					; RETRY
+defb	0, 0, 0, 10					; EXPIRE
+defb	0, 0, 0, 10					; MINIMUM
+.dns_longone2
+
+defb	10, "bufo-house", 3, "org", 0
+defb	0, DNS_TXT
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 35
+defb	34, "Bufo House, a Bufo Estates company"
+
+defb	10, "bufo-house", 3, "org", 0
+defb	0, DNS_NS
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 22
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+
+defb	3, "168", 3, "192", 7, "in-addr", 4, "arpa", 0
+defb	0, DNS_PTR
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 22
+defb	5, "koaks", 10, "bufo-house", 3, "org", 0
+
+; sugar (cpc); A, MX, HINFO, PTR
+; Two each of A and MX to test resolver
+
+defb	3, "cpc", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_CNAME
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 22
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_A
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 4
+defb	192, 168, 6, 128
+
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_A
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 4
+defb	1, 2, 3, 4
+
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_MX
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 24
+defb	0, 10						; PREFERENCE
+defb	5, "koaks", 10, "bufo-house", 3, "org", 0	; EXCHANGE
+
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_MX
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 24
+defb	0, 20						; PREFERENCE
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0	; EXCHANGE
+
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_HINFO
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 11
+defb	3, "Z80", 6, "AMSDOS"
+
+defb	3, "128", 1, "6", 3, "168", 3, "192", 7, "in-addr", 4, "arpa", 0
+defb	0, DNS_PTR
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 22
+defb	5, "sugar", 10, "bufo-house", 3, "org", 0
+
+; koaks; A, HINFO, PTR
+
+defb	5, "koaks", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_A
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 4
+defb	192, 168, 4, 86
+
+defb	5, "koaks", 10, "bufo-house", 3, "org", 0
+defb	0, DNS_HINFO
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 10
+defb	3, "486", 5, "Linux"
+
+defb	2, "86", 1, "4", 3, "168", 3, "192", 7, "in-addr", 4, "arpa", 0
+defb	0, DNS_PTR
+defb	0, DNS_IN
+defb	0, 0, 0, 10
+defb	0, 22
+defb	5, "koaks", 10, "bufo-house", 3, "org", 0
+
+defb	0
+
+
+if	SHOW_INFO
+
+.dns_showinfo
+
+push	de
+push	hl
+
+call	printstringimm
+defb	"DNS: query for domain name ", 0
+
+.dns_lowercaseifyqname
+
+ld	a, (de)
+inc	de
+or	a
+jr	z, dns_eoqname
+
+ld	b, a
+
+.dns_lowercaseifyqnamelabel
+
+ld	a, (de)
+push	bc
+push	de
+call	printcharverysafe
+pop	de
+pop	bc
+inc	de
+djnz	dns_lowercaseifyqnamelabel
+
+call	printstringimm
+defb	'.', 0
+
+jr	dns_lowercaseifyqname
+
+.dns_eoqname
+
+ld	a, (de)
+ld	h, a
+inc	de
+ld	a, (de)
+ld	l, a
+inc	de
+
+call	printstringimm
+defb	", type ", 0
+call	printdec2
+
+ld	a, (de)
+ld	h, a
+inc	de
+ld	a, (de)
+ld	l, a
+
+call	printstringimm
+defb	", class ", 0
+call	printdec2
+
+call	printcrlf
+
+pop	hl
+pop	de
+
+ret
+
+endif
+
+
+.dns_toosmall			; FIXME should send DNS_FMTERR error packet
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"DNS: datagram too small: ", 0
+ld	a, e
+call	printdec
+call	printcrlf
+endif
+
+ret
+
+
+.dns_badquery			; FIXME should send DNS_NOTIMPL error packet
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"DNS: bad query (not standard untruncated query): &", 0
+ld	a, (iy + DNS_QFLAGS)
+call	printhex
+call	printcrlf
+endif
+
+ret
+
+
+.dns_badquestion		; FIXME should send DNS_NOTIMPL error packet
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"DNS: bad query (not one question with no responses)", CR, LF, 0
+endif
+
+ret
+
+
+.dns_badlabel			; FIXME should send DNS_NOTIMPL error packet
+
+pop	de
+pop	hl
+pop	de
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"DNS: bad query (compression used)", CR, LF, 0
+endif
+
+ret
+
+
+.dns_badname			; FIXME should send DNS_FMTERR error packet
+
+pop	de
+pop	hl
+pop	de
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"DNS: bad query (QNAME under/overflow)", CR, LF, 0
+endif
+
+ret
+
+
+.dns_final
+
+; Close UDP bindings for DNS
+
+ld	hl, dns_server_bind
+jp	udp_close

@@ -1,0 +1,430 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<!-- http://www.nenie.org/cpcip/ -->
+
+<HTML>
+
+<HEAD>
+<TITLE>
+Using CPC/IP's telnet to read and send email and posts, and to surf
+</TITLE>
+</HEAD>
+
+<BODY>
+
+<H1>
+Using CPC/IP's telnet to read and send email and posts, and to surf
+</H1>
+
+<P>
+It's possible to use CPC/IP's telnet to read and send email
+and posts, and even to surf the net a bit, albeit with a degree
+of comfort the Spanish Inquisition would be proud of.
+</P>
+
+<H2>
+General considerations
+</H2>
+
+<P>
+Always use CPC/IP telnet's <KBD>-l</KBD> switch to enable line mode.
+If you don't, then any mistype will probably corrupt the line being entered.
+You can only send a line if the previous line has been received
+by the remote side; if when you press Return CPC/IP beeps at you
+and leaves the cursor where it is, then wait a bit and try again.
+Typically, you'll know when the
+previous line has been received by the remote side because
+some kind of response will be displayed.
+</P>
+
+<P>
+Generally, the procedure is to telnet to the so-called 'well-known' port
+(by typing the port number after the server address) and
+then to type in commands, with optional
+arguments (use a single space to separate any arguments).
+Commands are case-insensitive, unless otherwise specified.
+Command arguments are sometimes case-sensitive; when in doubt
+preserve case.  Command parameters are shown in angle brackets
+below; you need to replace them with your chosen command
+argument.
+</P>
+
+<P>
+You sometimes need to enter sensitive information such as
+passwords.  To foil all those prying eyes, use Ctrl-E before
+entering the sensitive information, and Ctrl-E again when
+it's been entered.
+</P>
+
+<P>
+Needless to say, the information below is only the tip of
+the iceberg.  For more information look at the RFCs.
+If things go really really bad, then Ctrl-[ is your friend!
+</P>
+
+<H2>
+Reading email using POP3
+</H2>
+
+<P>Port number: 110</P>
+<P>Server address: typically <VAR>pop3.*</VAR></P>
+<P>RFC: <A HREF="http://www.ietf.org/rfc/rfc1939.txt">RFC1939</A></P>
+
+<P>
+POP3 works by giving each message in your mailbox a number starting
+from 1.  That number is how you tell a POP3 server which message
+you want to deal with.
+</P>
+
+<H3>
+Step 1: logging on
+</H3>
+
+<P>
+Use <KBD>user &lt;username></KBD>
+and then <KBD>pass &lt;password></KBD> to log on.
+</P>
+
+<H3>
+Step 2: reading your email
+</H3>
+
+<P>
+Use <KBD>stat</KBD> to get a count of the total number of messages
+in your mailbox, and their total size.
+Use <KBD>list</KBD> to get a list of all the messages' numbers
+and sizes.
+Use <KBD>retr &lt;number></KBD> to read (retrieve) a message.
+Use <KBD>dele &lt;number></KBD> to mark a message for deletion;
+if you change your mind you can use <KBD>rset</KBD> to unmark
+all messages marked for deletion.
+Use <KBD>top &lt;number> &lt;lines></KBD>, if provided by your
+POP3 server, to read the first few lines of a message; this
+can be useful if the message is huge and you're not sure you're
+interested!
+Use <KBD>quit</KBD> to disconnect.  At this point, and only at
+this point, messages you marked for deletion are deleted from
+your mailbox (so if your connection terminates abnormally,
+before you've typed <KBD>quit</KBD>, nothing is lost).
+<STRONG>Note,
+however, that some POP3 servers may choose to auto-delete
+any messages which have been retrieved, even if not explicitly
+marked for deletion.</STRONG>
+</P>
+
+<H3>
+Example POP3 session
+</H3>
+
+<PRE>
+> telnet -l pop3.isp.com 110
+        ; We're connected!
+user cpcip
+pass k00lDUDE3!
+        ; We're logged in!
+stat
+        ; Oooh, three messages waiting for me!
+list
+        ; OK, they're all fairly small
+retr 1
+        ; Spam
+dele 1
+        ; No spam
+retr 2
+        ; It's from Archibald!  I must phone him right now
+quit
+        ; I'll keep 1 and read 3 another day
+</PRE>
+
+<H2>
+Posting email using SMTP
+</H2>
+
+<P>Port number: 25</P>
+<P>Server address: typically <VAR>mail.*</VAR> or <VAR>smtp.*</VAR></P>
+<P>RFCs: <A HREF="http://www.ietf.org/rfc/rfc0821.txt">RFC821</A>, <A HREF="http://www.ietf.org/rfc/rfc0822.txt">RFC822</A></P>
+
+<P>
+An email message consists of a header and a body.  The header
+contains the kind of stuff you get at the top of a letter: who
+the message is from, who it is to, the date, etc..  SMTP
+takes this message, and delivers it to the right person,
+given an envelope telling it whom to send it to and who it
+is from.
+</P>
+
+<H3>
+Step 1: working out which SMTP server to speak to
+</H3>
+
+<P>
+You can't telnet to the SMTP server without knowing which
+SMTP server to telnet to.  To determine this, use CPC/IP's
+DNS client: use <KBD>host -m &lt;domain></KBD>, where the
+domain is the bit after the @ in the email address.  Pick
+one of the mail exchanges given (preferably the one with
+lowest preference number); that's the SMTP server you need
+to telnet to.  If the DNS lookup fails, then you'll just
+have to try the domain itself and hope for the best.
+</P>
+
+<H3>
+Step 2: specifying the envelope
+</H3>
+
+<P>
+OK, so you've telneted into the right SMTP server.
+Use <KBD>helo &lt;domain></KBD> to say which machine you're on
+and then <KBD>mail from: &lt;addr></KBD> to say who you are.
+Then use <KBD>rcpt to: &lt;addr></KBD> one or more times
+to say who the message is to.  Note that addresses should be
+enclosed in angle brackets.
+</P>
+
+<H3>
+Step 3: giving the message
+</H3>
+
+<P>
+Use <KBD>data</KBD> to say that you now want to enter the message.
+The message consists of the header, then a blank line, then
+the body, then a line consisting of just a dot.  Any lines
+starting with dots in the body should have another dot added
+at the start of the line.
+</P>
+
+<P>
+The header consists of lines each containing a field name, a colon
+and the field value.  The fields can be in any order.
+The only mandatory ones are <VAR>From</VAR>, <VAR>To</VAR>
+(or some other destination specification) and <VAR>Date</VAR>.
+<VAR>From</VAR> is followed by an email address, which need
+not have angle brackets; <VAR>To</VAR> is the same, except
+that more than one address can be given, separated by commas.
+If you're lucky, then your SMTP server will accept messages
+without a <VAR>Date</VAR> field, else you'll have to come
+up with one of the godawful date formats allowed by RFC822.
+</P>
+
+<P>
+The optional fields include <VAR>Subject</VAR>, <VAR>Reply-To</VAR>
+and <VAR>cc</VAR>; the latter two are followed by one or more
+addresses, like <VAR>To</VAR>.
+</P>
+
+<P>
+When you've finished (don't forget the line with just a dot!),
+you can just use <KBD>quit</KBD> to finish, or start again
+with a fresh message to someone at the same domain, starting
+with the <KBD>mail from:</KBD>.
+</P>
+
+<H3>
+Example SMTP session
+</H3>
+
+<PRE>
+> host -m koaks.com
+        ; Ah, I'd better speak to mail.koaks.com, though I could use mailtoo 2
+> telnet -l mail.koaks.com 25
+        ; We're connected!
+helo bufo-house.org
+        ; Why, helleugh!
+mail from: &lt;cpcip@bufo-house.org>
+rcpt to: &lt;info@koaks.com>
+rcpt to: &lt;mark@koaks.com>
+data
+        ; OK, here goes...
+From: ams@bufo-house.org
+To: info@koaks.com, mark@koaks.com
+Date: Tue, 29 Feb 2400 12:34:50 GMT
+Subject: Site licence
+Reply-To: purchasing@bufo-house.org
+
+I would like to buy a site licence for CPC/IP.
+Please tell me how many cubic metres of euros would be needed.
+
+Alan
+
+-- 
+Bufo House, a Bufo Estates company
+..This line gratuitously starts with a single dot; the next one just has a dot
+..
+.
+        ; Phew!
+quit
+        ; Aaargh, I forgot to specify the currency unit size!
+</PRE>
+
+<H2>
+Reading and posting news using NNTP
+</H2>
+
+<P>Port number: 119</P>
+<P>Server address: typically <VAR>news.*</VAR> or <VAR>nntp.*</VAR></P>
+<P>RFCs: <A HREF="http://www.ietf.org/rfc/rfc0977.txt">RFC977</A>, <A HREF="http://www.ietf.org/rfc/rfc1036.txt">RFC1036</A></P>
+
+<P>
+Posts are very similar to email messages in that they consist
+of a header and a body.  There are a few extra fields, and
+various outrageous forms allowed in email messages (especially
+for email addresses) are forbidden, though.
+</P>
+
+<P>
+Articles in a given group on a given NNTP server are numbered;
+this number has no significance in another group or on another
+NNTP server.
+</P>
+
+<H3>
+Step 1: reading some news
+</H3>
+
+<P>
+Use <KBD>group &lt;name></KBD> to select a group.  The
+response from the NNTP server will confirm, from right to left,
+the group name, the last article number in that group, and
+the first article number in that group.
+</P>
+
+<P>
+Use <KBD>stat &lt;number></KBD> to select a message.  Then
+use <KBD>body</KBD> to retrieve that message's body,
+<KBD>head</KBD> to retrieve that message's header,
+and <KBD>article</KBD> to retrieve both.
+Use <KBD>last</KBD> to select the previous message,
+and <KBD>next</KBD> to select the next message.
+</P>
+
+<H3>
+Step 2: posting some news
+</H3>
+
+<P>
+Use <KBD>post</KBD> to say you want to post a message.
+The content is similar to that of an email message (so it's
+header then blank then body with any leading dot duplicated
+then line with just dot), but there's no <VAR>To</VAR> field,
+and the <VAR>Subject</VAR> field is mandatory.
+The <VAR>To</VAR> field is replaced by a <VAR>Newsgroups</VAR> field,
+which takes one or more comma-separated group names.
+A <VAR>Path</VAR> field and a <VAR>Message-ID</VAR> field
+are in principle mandatory, but just pray that your NNTP server
+will insert these for you!
+</P>
+
+<P>
+Incidentally, the first response from the NNTP server when you
+connected to it will tell you whether you're allowed to post
+or not; if it started <SAMP>200</SAMP> then you are, but if
+it started <SAMP>201</SAMP> then you aren't.
+</P>
+
+<H3>
+Step 3: going to bed
+</H3>
+
+<P>
+Use <KBD>quit</KBD>.
+</P>
+
+<H3>
+Example NNTP session
+</H3>
+
+<PRE>
+> telnet -l news.isp.com 119
+        ; We're connected!
+group comp.sys.amstrad.8bit
+        ; Ah, the last article number is 666
+stat 666
+head
+        ; This looks like spam
+last
+head
+        ; This looks interesting
+body
+        ; What?  That Speccy owner can't be allowed to get away with this
+post
+        ; OK, here goes...
+From: ams@bufo-house.org
+Newsgroups: comp.sys.amstrad.8bit,comp.sys.sinclair
+Date: Wed, 10 Mar 1987 17:12:34 GMT
+Subject: Re: Amstrad buys Sinclair
+Followup-To: alt.flame
+
+No, it was an act of selfless charity.  You should be more grateful!
+.
+        ; That'll teach her!
+quit
+</PRE>
+
+<H2>
+Surfing the net using HTTP
+</H2>
+
+<P>Port number: 80</P>
+<P>Server address: typically <VAR>www.*</VAR></P>
+<P>RFC: <A HREF="http://www.ietf.org/rfc/rfc2068.txt">RFC2068</A></P>
+
+<P>
+The WWW nowadays is 99% fluff and 1% content, and this applies
+both to the sites and to the pages.  So you'll have to have
+a sharp eye to spot the content among the crap as it scrolls
+past.  But feel free to try.
+</P>
+
+<H3>
+Step 1: fetching
+</H3>
+
+<P>
+First type <KBD>GET &lt;pathname> HTTP/1.0</KBD>, where
+the pathname is the bit after the hostname in the URL
+(including the leading slash).  Then type <KBD>Host: &lt;hostname></KBD>.
+Then enter a blank line.  All of this is case-sensitive.
+The connection will automatically be closed when the page
+(or error message!) has been transferred.
+</P>
+
+<P>
+Incidentally, if the URL has a colon and a number after
+the hostname, that indicates a non-default port number,
+which you should use instead of 80.
+</P>
+
+<H3>
+Example HTTP session
+</H3>
+
+<PRE>
+> telnet -l www.nenie.org 80
+        ; We're connected!
+GET / HTTP/1.0
+Host: www.nenie.org
+
+        ; Oooh, what an uncommonly nice homepage this is!
+</PRE>
+
+<HR>
+
+<P>
+Mark RISON,
+&lt;<A HREF="mailto:mrison@hotmail.com">mrison@hotmail.com</A>>,
+2001-06-03
+</P>
+
+<P>
+Thanks to Franck ARNAUD for hosting these pages.
+</P>
+
+<P>
+<A HREF="http://validator.w3.org/check/referer">
+<IMG BORDER="0" SRC="http://www.w3.org/Icons/valid-html32"
+     ALT="Valid HTML 3.2!" height="31" width="88">
+</A>
+</P>
+
+</BODY>
+
+</HTML>

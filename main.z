@@ -1,0 +1,641 @@
+; CPC/IP v0.20
+; Copyright (c) 1999-2001 Mark RISON, mrison@hotmail.com
+
+
+read	"config.z"
+
+nolist
+
+
+; Major FIXMEs:
+; - understand DNS better and get resolv right for gethostbyname (incl. CNAMEs)
+; - enhance portability (especially re file I/O)
+; - rewrite tftpd (support RRQs, use stdio, etc.)
+; - Add some token TIMEWAIT state to TCP
+; Less major FIXMEs:
+; - rename dns_ to dnsd_
+; - rename tftp_ to tftpd_
+; - make PPP a bit more robust (incl. timeouts and a bit of state)
+; - improve initialisation (e.g. zero-init datalink stuff)
+; - use file handles for portability
+; - sort out authoritativeness in DNSD
+; - give the serial driver a chance to try to empty its tx buffers on finalise
+; - make tipi's error handling a bit more user-friendly
+; - use UCP_OFFSETOF_*
+; - redefine TFTP/DNS offsets as being from after UDP header
+; - set IP ID field properly
+; - set IP TOS field properly
+; - handle RRQs in TFTPD
+; - fix ICMP stuff
+; - put RFC references in each appropriate .z file
+
+
+.main
+
+call	stdio_init
+
+call	printstringimm
+defb	"CPC/IP v0.20 on ", 0
+ld	hl, config_hostaddr
+call	printipaddr
+call	printstringimm
+if	IS128K
+defb	" (128"
+else
+defb	" (64"
+endif
+defb	"K memory configuration, "
+if	PPP
+defb	"PPP"
+else
+defb	"SLIP"
+endif
+defb	" link)", CR, LF
+defb	"Copyright (c) 1999-2001 Mark RISON, mrison@hotmail.com", CR, LF, 0
+call	TXT_CUR_ON
+
+call	serial_init
+if	TIMEOUT
+call	timeout_init
+endif
+
+; Initialise servers and clients here
+
+if	TFTPD
+call	tftp_init
+endif
+if	HTTPD
+call	httpd_init
+endif
+if	DNSD
+call	dns_init
+endif
+if	TELNET
+call	telnet_init
+endif
+if	FINGER
+call	finger_init
+endif
+if	HOST
+call	host_init
+endif
+if	PING
+call	ping_init
+endif
+if	IFCONFIG
+call	ifconfig_init
+endif
+if	RESOLV
+call	resolv_init
+endif
+
+ld	hl, datalink_flags
+call	datalink_isopen
+call	nz, keyb_displayprompt
+
+
+.main_loop
+
+; Handle timeouts
+
+if	TIMEOUT
+call	timeout_dispatch
+endif
+
+; Handle loopback
+
+if	LOOPBACK
+call	main_handleloopback
+endif
+
+; Handle serial rx char
+
+call	serial_getchar
+call	c, main_handlerxchar
+
+; Handle keyboard char
+
+call	KM_READ_CHAR
+call	c, main_handletxchar
+
+jr	main_loop
+
+
+.main_done
+
+pop	hl			; Pop return address for main_handletxchar
+
+; Finalise servers and clients here
+
+if	RESOLV
+call	resolv_final
+endif
+if	IFCONFIG
+call	ifconfig_final
+endif
+if	PING
+call	ping_final
+endif
+if	HOST
+call	host_final
+endif
+if	FINGER
+call	finger_final
+endif
+if	TELNET
+call	telnet_final
+endif
+if	DNSD
+call	dns_final
+endif
+if	HTTPD
+call	httpd_final
+endif
+if	TFTPD
+call	tftp_final
+endif
+if	TIMEOUT
+call	timeout_final
+endif
+call	serial_final
+
+jp	stdio_final
+
+
+if	LOOPBACK
+
+.main_handleloopback
+
+; If ipbuffer empty, try to suck packets out of loopback
+
+call	datalink_isempty
+ret	c
+
+.main_getlooped
+
+call	loopback_remove
+ret	nc
+jr	main_getlooped
+
+endif
+
+
+.main_handlerxchar
+
+; Pass serial rx chars to datalink if up
+
+ld	hl, datalink_flags
+call	datalink_isup
+jp	nz, datalink_handlechar
+
+if	PPP
+
+; PPP comes up when PPP_ADDR is received
+
+cp	PPP_ADDR
+
+else
+
+; SLIP comes up when SLIP_END is received
+
+cp	SLIP_END
+
+endif
+
+jp	z, datalink_up
+
+; Otherwise print out the received char
+
+ld	hl, main_parseC
+ld	c, (hl)
+call	util_parsechar
+ld	(hl), c
+ret	c
+cp	NL
+jp	z, printcrlf
+jp	printcharsafe
+
+.main_parseC
+
+defb	0
+
+
+.main_handletxchar
+
+; Check for exit character
+
+cp	KQUIT
+jr	z, main_done
+
+; Check for datalink toggling character
+
+ld	hl, datalink_flags
+cp	KTOGGLE
+jp	z, datalink_toggle
+
+; Pass to serial tx if datalink down
+
+call	datalink_isup
+jp	z, serial_putchar
+
+; Drop if datalink not open
+
+call	datalink_isopen
+ret	z
+
+; Pass to key handler if client active
+
+ld	hl, (keyb_client_keyhandler)
+ld	b, a
+ld	a, h
+or	l
+ld	a, b
+jp	nz, callhl
+
+; Otherwise accumulate in keyboard line buffer
+
+cp	CTRL_E
+jr	z, keyb_toggle_echo
+
+cp	128			; Any top-bit-set char is EOL
+jr	nc, keyb_complete
+
+cp	32			; Any control char is EOL
+jr	c, keyb_complete
+
+ld	hl, (keybbufferinsert)
+
+cp	DEL
+jr	z, keyb_del
+
+ld	(hl), a
+inc	l
+jr	z, keyb_overflow
+
+ld	(keybbufferinsert), hl
+ld	hl, keyb_echo
+bit	0, (hl)
+ret	z
+jp	printcharverysafe
+
+.keyb_overflow
+
+ld	a, BEL
+jp	printcharsafe
+
+.keyb_toggle_echo
+
+ld	a, (keyb_echo)
+xor	TRUE
+ld	(keyb_echo), a
+
+ret
+
+.keyb_del
+
+dec	l
+inc	l
+jr	z, keyb_overflow
+
+dec	l
+ld	(keybbufferinsert), hl
+
+ld	hl, keyb_echo
+bit	0, (hl)
+ret	z
+
+call	printstringimm
+defb	BS, ' ', BS, 0
+
+ret
+
+.keyb_continue
+
+; On entry:
+;	C = length
+; On exit:
+;	A corrupted, F preserved
+
+call	printstringimm
+defb	BEL, 0
+ld	a, c
+ld	(keybbufferinsert), a
+
+ret
+
+.keyb_complete
+
+ld	hl, (keybbufferinsert)
+ld	c, l
+ld	(hl), NUL		; NUL-terminated
+ld	l, 0
+ld	(keybbufferinsert), hl
+ex	de, hl
+
+ld	hl, (keyb_client_linehandler)
+ld	b, a
+ld	a, h
+or	l
+ld	a, b
+ld	b, 0
+jp	nz, callhl
+
+cp	ESC			; Accept ESC and CTRL-C as line abort
+jp	z, keyb_displayprompt
+cp	CTRL_C
+jp	z, keyb_displayprompt
+
+cp	CR			; Only accept CR as valid EOL
+jr	nz, keyb_continue	; Everything else is noise
+
+call	printcrlf
+
+ex	de, hl
+call	util_skipspace
+
+ld	a, (hl)			; Skip empty lines
+or	a
+jr	z, keyb_displayprompt
+
+ld	c, l
+
+if	FINGER
+ld	de, keyb_finger_cmd
+ld	b, keyb_finger_cmdend - keyb_finger_cmd
+call	memicmp
+jp	z, finger_do
+endif
+
+if	TELNET
+ld	l, c
+ld	de, keyb_telnet_cmd
+ld	b, keyb_telnet_cmdend - keyb_telnet_cmd
+call	memicmp
+jp	z, telnet_du
+endif
+
+if	HOST
+ld	l, c
+ld	de, keyb_host_cmd
+ld	b, keyb_host_cmdend - keyb_host_cmd
+call	memicmp
+jp	z, host_do
+endif
+
+if	PING
+ld	l, c
+ld	de, keyb_ping_cmd
+ld	b, keyb_ping_cmdend - keyb_ping_cmd
+call	memicmp
+jp	z, ping_do
+endif
+
+if	IFCONFIG
+ld	l, c
+ld	de, keyb_ifconfig_cmd
+ld	b, keyb_ifconfig_cmdend - keyb_ifconfig_cmd
+call	memicmp
+jp	z, ifconfig_do
+endif
+
+if	MARK_HACKS
+ld	l, c
+ld	de, keyb_snarf_cmd
+ld	b, keyb_snarf_cmdend - keyb_snarf_cmd
+call	memicmp
+jr	z, snarf_do
+endif
+
+ld	l, c
+ld	de, keyb_quit_cmd
+ld	b, keyb_quit_cmdend - keyb_quit_cmd
+call	memicmp
+jp	z, main_done
+
+call	printstringimm
+defb	"Bad command", 0
+jr	keyb_displayprompt
+
+
+if	MARK_HACKS
+
+.snarf_do
+
+call	util_skipspace
+ld	d, h
+ld	e, l
+call	util_skiptospace
+or	a
+sbc	hl, de
+jr	z, keyb_client_done
+ld	b, l
+ex	de, hl
+ld	de, amsdoswritebuf
+call	CAS_OUT_OPEN
+ld	hl, ipbuffer
+ld	de, 1024
+ld	bc, 0
+ld	a, 2
+CAS_OUT_DIRECT	equ	&bc98
+call	CAS_OUT_DIRECT
+call	CAS_OUT_CLOSE
+call	CAS_OUT_ABANDON
+jr	keyb_client_done
+
+endif
+
+
+.keyb_client_doing
+
+; On entry to handler:
+;	A = char
+; On exit from handler:
+;	AF, BC, DE, HL, IX, IY corrupted
+
+ld	(keyb_client_keyhandler), hl
+
+ret
+
+
+.keyb_line_doing
+
+; On entry to handler:
+;	A = EOL char
+;	B = 0
+;	C = length (excluding EOL char and NUL)
+;	DE -> data (NUL-terminated)
+; On exit from handler:
+;	AF, BC, DE, HL, IX, IY corrupted
+
+ld	(keyb_client_linehandler), hl
+push	hl
+ld	hl, 0
+ld	(keyb_client_keyhandler), hl
+pop	hl
+
+ret
+
+
+.keyb_client_done
+
+ld	hl, 0
+ld	(keyb_client_keyhandler), hl
+ld	(keyb_client_linehandler), hl
+
+.keyb_displayprompt
+
+call	printcrlfmaybe
+call	printstringimm
+defb	PROMPT, ' ', 0
+
+ret
+
+
+if	TELNET
+.keyb_telnet_cmd
+defb	"telnet"
+.keyb_telnet_cmdend
+endif
+
+if	FINGER
+.keyb_finger_cmd
+defb	"finger"
+.keyb_finger_cmdend
+endif
+
+if	HOST
+.keyb_host_cmd
+defb	"host"
+.keyb_host_cmdend
+endif
+
+if	PING
+.keyb_ping_cmd
+defb	"ping"
+.keyb_ping_cmdend
+endif
+
+if	IFCONFIG
+.keyb_ifconfig_cmd
+defb	"ifconfig"
+.keyb_ifconfig_cmdend
+endif
+
+if	MARK_HACKS
+.keyb_snarf_cmd
+defb	"snarf"
+.keyb_snarf_cmdend
+endif
+
+.keyb_quit_cmd
+defb	"quit"
+.keyb_quit_cmdend
+
+
+.keybbufferinsert
+
+defw	keybbuffer
+
+.keyb_echo
+
+defb	TRUE
+
+.keyb_client_keyhandler
+
+defw	0
+
+.keyb_client_linehandler
+
+defw	0
+
+
+; These two must be below &4000 in the 128K memory configuration
+; (i.e. below bank 1 -- which gets switched out!)
+
+if	INTDRIVEN
+read	"serialdd.z"
+endif
+
+if	LOOPBACK
+read	"loopback.z"
+endif
+
+; The following can be anywhere, fortunately!
+
+if	PPP
+PPP_FCSTAB16_PAGEALIGNED	equ	0
+read	"fcstab16.z"
+read	"ppp.z"
+else
+read	"slip.z"
+endif
+read	"stdio.z"
+if	TIMEOUT
+read	"timeout.z"
+endif
+read	"ip.z"
+read	"cs.z"
+read	"icmp.z"
+if	TCP
+read	"tcp.z"
+endif
+if	UDP
+read	"udp.z"
+endif
+
+; The following must be above &3fff
+; (i.e. above bank 0 -- where event blocks can't be!)
+
+if	TFTPD
+read	"tftpd.z"
+endif
+if	HTTPD
+read	"httpd.z"
+endif
+if	DNSD
+read	"dnsd.z"
+else
+dns_resourcerecords	equ	0
+endif
+if	TELNET
+read	"telnet.z"
+read	"cons.z"
+endif
+if	FINGER
+read	"finger.z"
+endif
+if	HOST
+read	"host.z"
+endif
+if	PING
+read	"ping.z"
+endif
+if	IFCONFIG
+read	"ifconfig.z"
+endif
+if	RESOLV
+read	"resolv.z"
+endif
+if	HOSTS
+read	"hosts.z"
+else
+hosts_txt	equ	0
+endif
+read	"printlib.z"
+read	"utillib.z"
+if	UDP or TCP
+read	"linklist.z"
+endif
+
+; The following must be above &7fff in the 128K memory configuration
+; (i.e. bank 2 -- where both event blocks and banking code can be!)
+
+if	POLLED
+if	IS128K
+org	specialcode
+endif
+read	"serialdd.z"
+endif
+
+list
+end

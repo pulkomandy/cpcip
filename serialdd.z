@@ -1,0 +1,772 @@
+; CPC/IP serial device driver for Amstrad/Pace RS232C
+; and CPC Amstrad International (1992-06/07) serial interfaces
+; Copyright (c) 1999-2001 Mark RISON
+
+; A serial device driver must export the following routines
+; (the entry/exit conditions are described here at the top of each):
+; serial_init, serial_final, serial_getchar, serial_putchar
+
+; A serial device driver may expect the following imported symbols:
+; BIT_RATE,
+; PARITY_NONE, PARITY_ODD, PARITY_EVEN,
+; STOP_1, STOP_15, STOP_2,
+; MEMCONFIG, IS64K, IS128K,
+; INTDRIVEN, POLLED,
+; HWFLOWCONTROL,
+; serialtxbuffer, serialtxbufsiz, serialrxbuffer, serialrxbufsiz
+
+; Note the Pace interface does not support being interrupt-driven
+; unless a hardware modification has been made.
+; The CPCAI interface does not support being interrupt-driven,
+; nor does it support datarates other than 2400 bps, and it
+; mandates hardware flow control.
+
+
+if	AMSTRAD or PACE
+
+SIO_A_DATA	equ	&fadc
+SIO_A_CONTROL	equ	&fadd
+
+HBIT_RATE	equ	BIT_RATE / 100
+INV_RATE	equ	1250 / HBIT_RATE
+
+if	PARITY_NONE
+PARITY_BITS	equ	0
+endif
+if	PARITY_ODD
+PARITY_BITS	equ	1
+endif
+if	PARITY_EVEN
+PARITY_BITS	equ	3
+endif
+
+if	STOP_1
+STOP_BITS	equ	4
+endif
+if	STOP_1_5
+STOP_BITS	equ	8
+endif
+if	STOP_2
+STOP_BITS	equ	12
+endif
+
+WR0_RESETTXINT	equ	&28
+WR0_RESET	equ	&18		; channel reset
+if	INTDRIVEN
+WR1_INIT	equ	&1a		; tx and all rx int
+else
+WR1_INIT	equ	&00		; no ints
+endif
+if	HWFLOWCONTROL
+if	PACE
+error	"Pace serial interface doesn't support hardware flow control"
+; If the hardware modification has been made,
+; it should be considered an honorary Amstrad serial interface!
+endif
+WR3_INIT	equ	&e1		; 8 data rx, hw flow, rx enable
+else
+WR3_INIT	equ	&c1		; 8 data rx, no hw flow, rx enable
+endif
+WR4_INIT	equ	&40 or STOP_BITS or PARITY_BITS	; x16 clk
+WR5_INIT	equ	&ea		; DTR+RTS active, 8 data tx, tx enable
+WR5_RTSACTIVE	equ	&ea
+WR5_RTSINACTIVE equ	&e8
+
+WR1		equ	1
+WR3		equ	3
+WR4		equ	4
+WR5		equ	5
+
+RR0_RESETTEST_MASK	equ	&07
+RR0_RESETTEST_RESULT	equ	&04
+
+CTC_CT0		equ	&fbdc
+CTC_CT1		equ	&fbdd
+CTC_MODE	equ	&fbdf
+
+MODE_CT0	equ	&36
+MODE_CT1	equ	&76
+
+else		; CPCAI
+
+MC6850_CONTROL	equ	&f8dc
+MC6850_DATA	equ	&f8dd
+
+if	HWFLOWCONTROL
+else
+error	"CPCAI serial device driver mandates use of hardware flow control"
+endif
+
+if 	INTDRIVEN
+error	"CPCAI serial device driver only supports polling"
+endif
+
+if	STOP_1_5
+error	"CPCAI serial device driver doesn't support 1 1/2 stop bits"
+endif
+
+if	STOP_2
+if	PARITY_EVEN or PARITY_ODD
+error	"CPCAI serial device driver doesn't support 2 stop bits with parity"
+endif
+FRAMING_BITS	equ	&10
+else	; !STOP_2
+if	PARITY_NONE
+FRAMING_BITS	equ	&14
+endif
+if	PARITY_EVEN
+FRAMING_BITS	equ	&18
+endif
+if	PARITY_ODD
+FRAMING_BITS	equ	&1c
+endif
+endif	; STOP_2
+
+if	BIT_RATE - 2400
+error	"CPCAI serial device driver only supports 2400 bps"
+else
+DIVIDE_16	equ	1
+MASTER_RESET	equ	3
+endif
+
+RTSASSERTED_TXINTOFF	equ	&00
+RTSASSERTED_TXINTON	equ	&20
+RTSDEASSERTED_TXINTOFF	equ	&40
+RTSASSERTED_TXBRK_TXINTOFF equ	&60
+
+RXINTOFF		equ	&00
+RXINTON			equ	&80
+
+MC6850_RESETTEST_MASK	equ	&f3
+MC6850_RESETTEST_RESULT	equ	&02
+
+MC6850_CONTROL_RTSASSERTED	equ	DIVIDE_16 or FRAMING_BITS or RTSASSERTED_TXINTOFF or RXINTOFF
+MC6850_CONTROL_RTSDEASSERTED	equ	DIVIDE_16 or FRAMING_BITS or RTSDEASSERTED_TXINTOFF or RXINTOFF
+
+endif
+
+
+TXACTIVE	equ	0
+
+
+if	IS128K
+BANK_TXBUFFER	equ	&7fc5		; bank 5 at &4000
+BANK_RXBUFFER	equ	&7fc4		; bank 4 at &4000
+BANK_RESTORE	equ	&7fc0		; bank 1 at &4000
+endif
+
+
+.serial_init
+
+; Initialise serial device and driver
+; AF, BC, DE, HL may be corrupted
+; Interrupts may be disabled and then reenabled
+
+di
+
+if	INTDRIVEN
+
+INTERRUPT_ENTRY equ	&0038
+EXT_INTERRUPT	equ	&003b
+
+NEW_CODE	equ	&bdc4		; 6 unused bytes
+
+; Allow Z80 support chip interrupts to work
+; (based on Soft 968 App. XIII.7, but optimised)
+
+ld	hl, (INTERRUPT_ENTRY + 1) ; HL = ADDRESS_X
+ld	de, 5
+add	hl, de			; HL = ADDRESS_X + 5
+
+ld	de, call_new_code	; Copy the CALL NEW_CODE patch
+ex	de, hl			; to ADDRESS_X + 5
+ld	bc, 4
+ldir
+
+ld	hl, new_code_patch	; Copy the NEW_CODE patch itself
+ld	de, NEW_CODE		; to NEW_CODE
+ld	bc, 6
+ldir
+
+; Patch in external interrupt handler
+; Assume sole external interrupt source
+
+ld	hl, ext_interrupt_patch
+ld	de, EXT_INTERRUPT
+ld	bc, 3
+ldir
+
+endif	; INTDRIVEN
+
+if	AMSTRAD or PACE
+
+; Initialise CTC
+
+ld	bc, CTC_MODE
+ld	a, MODE_CT0
+out	(c), a
+ld	c, CTC_CT0 and &ff
+ld	a, INV_RATE and &ff
+out	(c), a
+ld	a, INV_RATE / 256
+out	(c), a
+ld	c, CTC_MODE and &ff
+ld	a, MODE_CT1
+out	(c), a
+ld	c, CTC_CT1 and &ff
+ld	a, INV_RATE and &ff
+out	(c), a
+ld	a, INV_RATE / 256
+out	(c), a
+
+; Initialise SIO
+
+ld	bc, SIO_A_CONTROL
+ld	d, WR0_RESET
+out	(c), d
+in	a, (c)
+ld	d, WR4			; Technical manual says do WR4 before 1/3/5
+out	(c), d
+ld	d, WR4_INIT
+out	(c), d
+ld	d, WR3
+out	(c), d
+ld	d, WR3_INIT
+out	(c), d
+ld	d, WR5
+out	(c), d
+ld	d, WR5_INIT
+out	(c), d
+ld	d, WR1			; Appnote suggests doing WR1 last
+out	(c), d
+ld	d, WR1_INIT
+out	(c), d
+
+; Check it's all (apparently) there!
+
+and	RR0_RESETTEST_MASK
+cp	RR0_RESETTEST_RESULT
+
+else	; CPCAI
+
+; Initialise MC6850
+
+ld	bc, MC6850_CONTROL
+
+ld	a, MASTER_RESET or FRAMING_BITS or RTSDEASSERTED_TXINTOFF or RXINTOFF
+out	(c), a
+
+ld	a, MC6850_CONTROL_RTSASSERTED
+out	(c), a
+
+; Check it's all (apparently) there!
+
+in	a, (c)
+and	MC6850_RESETTEST_MASK
+cp	MC6850_RESETTEST_RESULT
+
+endif
+
+ei
+
+jr	nz, serial_notresponding
+
+if	POLLED
+
+; Initialise fast ticker events for polling
+
+KL_NEW_FAST_TICKER	equ	&bce0
+
+ld	hl, serial_fasttickerblock
+ld	de, serial_interrupt_handler
+ld	bc, &c100		; Express asynchronous event at near address
+call	KL_NEW_FAST_TICKER
+
+endif	; POLLED
+
+call	printstringimm
+defb	"Serial interface driver initialised (", 0
+
+ld	hl, BIT_RATE
+call	printdec2
+
+call	printstringimm
+defb	" bps, 8"
+
+if	PARITY_NONE
+defb	"N"
+endif
+if	PARITY_EVEN
+defb	"E"
+endif
+if	PARITY_ODD
+defb	"O"
+endif
+
+if	STOP_1
+defb	"1"
+endif
+if	STOP_1_5
+defb	"1 1/2"
+endif
+if	STOP_2
+defb	"2"
+endif
+
+defb	", "
+if	HWFLOWCONTROL
+else
+defb	"no "
+endif
+defb	"hw flow, "
+
+if	INTDRIVEN
+defb	"int-driven"
+else
+defb	"polled"
+endif
+
+defb	")", CR, LF, 0
+
+ret
+
+.serial_notresponding
+
+call	printstringimm
+if	AMSTRAD
+defb	"*** Amstrad serial interface not responding ***", CR, LF, 0
+else
+if	PACE
+defb	"*** Pace serial interface not responding ***", CR, LF, 0
+else
+defb	"*** CPCAI serial interface not responding ***", CR, LF, 0
+endif
+endif
+
+ret
+
+if	POLLED
+
+.serial_fasttickerblock
+
+defs	9
+
+endif
+
+
+.serial_final
+
+; Close down serial device
+; AF, BC, DE, HL may be corrupted
+; Interrupts may be disabled and then reenabled
+
+if	POLLED
+
+KL_DEL_FAST_TICKER	equ	&bce6
+
+ld	hl, serial_fasttickerblock
+call	KL_DEL_FAST_TICKER
+
+endif	; POLLED
+
+if	AMSTRAD or PACE
+
+ld	bc, SIO_A_CONTROL
+ld	a, WR0_RESET
+out	(c), a
+
+else
+
+ld	bc, MC6850_CONTROL
+ld	a, MASTER_RESET or FRAMING_BITS or RTSASSERTED_TXINTOFF or RXINTOFF
+out	(c), a
+
+endif
+
+ret
+
+
+.serial_getchar
+
+; On exit, A = next character from the serial rx buffer
+; C clear if no character available (A corrupted)
+; Other flags corrupted
+; Interrupts enabled
+
+push	de
+push	hl
+or	a
+di
+
+ld	hl, (rxbufferinsert)
+ld	de, (rxbufferremove)
+sbc	hl, de			; HL = # chars in buffer (modulo buffer size)
+jr	z, serial_getchar_none	; C clear if no char
+
+if	IS128K
+push	bc
+endif
+
+if	HWFLOWCONTROL
+
+xor	a			; Reactivate RTS if # free = &ff
+cp	l
+jr	nz, serial_nortsactivateneeded
+ld	a, h
+cpl
+and	serialrxbufsiz / 256 - 1
+jr	nz, serial_nortsactivateneeded
+
+if	IS64K
+push	bc
+endif
+
+if	AMSTRAD or PACE
+ld	bc, SIO_A_CONTROL
+ld	a, WR5
+out	(c), a
+ld	a, WR5_RTSACTIVE
+else
+ld	bc, MC6850_CONTROL
+ld	a, MC6850_CONTROL_RTSASSERTED
+endif
+out	(c), a
+
+if	IS64K
+pop	bc
+endif
+
+.serial_nortsactivateneeded
+
+endif	; HWFLOWCONTROL
+
+if	IS128K
+ld	bc, BANK_RXBUFFER
+out	(c), c
+endif
+
+ld	a, (de)
+
+if	IS128K
+ld	c, BANK_RESTORE AND &ff
+out	(c), c
+
+pop	bc
+endif
+
+inc	de
+
+if	IS128K
+set	6, d
+res	7, d
+else
+set	2, d
+set	3, d
+res	4, d
+endif
+
+ld	(rxbufferremove), de
+scf				; C set if char
+
+.serial_getchar_none
+
+ei
+pop	hl
+pop	de
+ret
+
+
+.serial_putchar
+
+; On entry, A = character to put in the serial tx buffer
+; All regs preserved
+; Interrupts enabled
+; The behaviour is undefined (but not fatal) if the buffer is full
+
+push	af
+if	IS128K
+push	bc
+endif
+push	hl
+ld	hl, txflags
+di
+
+bit	TXACTIVE, (hl)
+jr	nz, serial_putchar_txisactive
+
+if	IS64K
+push	bc
+endif
+
+if	AMSTRAD or PACE
+ld	bc, SIO_A_DATA
+else
+ld	bc, MC6850_DATA
+endif
+out	(c), a
+
+if	IS64K
+pop	bc
+endif
+
+set	TXACTIVE, (hl)
+jr	serial_putchar_txwasinactive
+
+.serial_putchar_txisactive
+
+ld	hl, (txbufferinsert)
+
+if	IS128K
+ld	bc, BANK_TXBUFFER
+out	(c), c
+endif
+
+ld	(hl), a
+
+if	IS128K
+ld	c, BANK_RESTORE AND &ff
+out	(c), c
+endif
+
+inc	hl
+
+if	IS128K
+set	6, h
+res	7, h
+else
+res	2, h
+endif
+
+ld	(txbufferinsert), hl
+
+.serial_putchar_txwasinactive
+
+ei
+pop	hl
+if	IS128K
+pop	bc
+endif
+pop	af
+ret
+
+
+.serial_interrupt_handler
+
+; AF, BC, DE, HL may be corrupted (see Soft 968
+; pages 11.2 and 18.21 for interrupt-driven, and
+; pages 11.3 and 15.200 for fast ticker-driven)
+
+; If interrupt-driven, assume sole external interrupt source,
+; and don't try to cope with rx and tx interrupts simultaneously.
+;
+; If polled, rx as many characters as there are in the FIFO
+; (could be up to 3 for Z80-SIO) and then tx a character if waiting
+; (there's no tx FIFO so no point looping).
+
+if	AMSTRAD or PACE
+ld	bc, SIO_A_CONTROL
+else
+ld	bc, MC6850_CONTROL
+endif
+in	a, (c)
+
+rra				; b0 set if rx available
+jr	nc, serial_txinterrupt
+
+.serial_rxinterrupt
+
+if	AMSTRAD or PACE
+dec	c			; SIO_A_DATA
+else
+inc	c			; MC6850_DATA
+endif
+in	a, (c)
+
+ld	hl, (rxbufferremove)
+ld	de, (rxbufferinsert)
+
+if	IS128K
+ld	bc, BANK_RXBUFFER
+out	(c), c
+endif
+
+ld	(de), a
+
+if	IS128K
+ld	c, BANK_RESTORE and &ff
+out	(c), c
+endif
+
+inc	de			; COULD argue rx buffer full should never happen if HWFLOWCONTROL (because of RTS) and so not test (but still need SBC for RTS test)
+
+if	IS128K
+set	6, d
+res	7, d
+else
+set	2, d
+set	3, d
+res	4, d
+endif
+
+or	a
+sbc	hl, de			; HL = # free in buffer + 1 after this rx buffered
+jr	z, serial_rxbufferfull	; (modulo buffer size)
+
+ld	(rxbufferinsert), de
+
+if	HWFLOWCONTROL
+
+ld	a, h			; Deactivate RTS if # free + 1 <= &ff
+and	serialrxbufsiz / 256 - 1; (i.e. # free < &ff)
+jr	z, serial_rtsdeactivateneeded	; (don't bother checking lsb as this should stop rx ints quite quickly)
+
+.serial_rxbufferfull		; Should never happen if RTS honoured
+
+if	INTDRIVEN
+reti
+else
+jr	serial_interrupt_handler
+endif
+
+.serial_rtsdeactivateneeded
+
+if	AMSTRAD or PACE
+ld	bc, SIO_A_CONTROL
+ld	a, WR5
+out	(c), a
+ld	a, WR5_RTSINACTIVE
+else
+ld	bc, MC6850_CONTROL
+ld	a, MC6850_CONTROL_RTSDEASSERTED
+endif
+out	(c), a
+
+else	; !HWFLOWCONTROL
+
+.serial_rxbufferfull
+
+endif	; HWFLOWCONTROL
+
+if	INTDRIVEN
+reti
+else
+jr	serial_interrupt_handler
+endif
+
+.serial_txinterrupt
+
+if	POLLED
+if	AMSTRAD or PACE
+rra				; b2 set if tx empty
+rra
+else
+rra				; b1 set if tx empty
+endif
+jr	nc, serial_interrupt_done
+endif
+
+ld	hl, (txbufferinsert)
+ld	de, (txbufferremove)
+xor	a
+if	POLLED
+				; Fix firmware bug for express async events
+ld	(serial_fasttickerblock + 4), a	; (see Soft 968 App. XIII.3)
+endif
+sbc	hl, de
+jr	z, serial_nothingmoretosend
+
+if	IS128K
+ld	bc, BANK_TXBUFFER
+out	(c), c
+endif
+
+ld	a, (de)
+
+if	IS128K
+ld	c, BANK_RESTORE and &ff
+out	(c), c
+endif
+
+if	AMSTRAD or PACE
+ld	bc, SIO_A_DATA
+else
+ld	bc, MC6850_DATA
+endif
+out	(c), a
+
+inc	de
+
+if	IS128K
+set	6, d
+res	7, d
+else
+res	2, d
+endif
+
+ld	(txbufferremove), de
+
+reti
+
+.serial_nothingmoretosend
+
+ld	(txflags), a		; Assumes txflags only contains TXACTIVE
+if	AMSTRAD or PACE
+ld	a, WR0_RESETTXINT
+out	(c), a
+endif
+
+reti
+
+if	POLLED
+
+.serial_interrupt_done
+
+xor	a			; Fix firmware bug for express async events
+ld	(serial_fasttickerblock + 4), a	; (see Soft 968 App. XIII.3)
+
+reti
+
+endif
+
+
+if	INTDRIVEN
+
+.ext_interrupt_patch
+
+jp	serial_interrupt_handler
+
+.call_new_code
+
+call	NEW_CODE
+nop
+
+.new_code_patch
+
+ld	a, c
+scf
+ex	af, af'
+ei
+reti
+
+endif	; INTDRIVEN
+
+
+.rxbufferinsert
+
+defw	serialrxbuffer
+
+.rxbufferremove
+
+defw	serialrxbuffer
+
+.txbufferinsert
+
+defw	serialtxbuffer
+
+.txbufferremove
+
+defw	serialtxbuffer
+
+.txflags
+
+defb	0

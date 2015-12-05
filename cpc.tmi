@@ -1,0 +1,105 @@
+cpc|CPC/IP console,
+#
+# Install this using "tic <filename>" (as root).
+#
+# Known issues:
+#
+# - you can't get 80 chars across on the command line;
+#   xenl seems to fix this for some reason but screws
+#   up other things such as emacs
+#
+# - csr not used because it's not well documented enough
+#   (e.g. what do clear and cup do after it?)
+#
+# - things may behave slightly differently depending on
+#   whether the cursor is visible or not (because the
+#   cursor is forced to a valid position if displayed)
+#
+# - the "lantern" acsc char is not available; I think it
+#   looks like two triangles one above the other, meeting
+#   in the middle at their point
+#
+# - how exactly does a "board of squares" acsc char differ
+#   from a "checker board"?
+#
+# - extra acsc chars { and } (for pi and pound respectively)
+#   are defined (but pound will come out as peseta on Spanish
+#   systems, and +/- won't work either)
+#
+# - the acsc char for degree isn't ideal (it could be on
+#   French systems -- use \242)
+#
+# - setaf/setab are hacks to prevent pppconfig version 1.1
+#   from using some VT-like control codes for colour
+#   (having empty definitions is not sufficient)
+#
+# - insert/delete operations not used because the documentation
+#   implies they cause rejigging of chars on the screen
+#
+# - please report any problems and/or suggest improvements!
+#
+# Mark RISON, mrison@hotmail.com , 1999-11-28
+#
+# auto_right_margin
+	am, 
+# auto_left_margin
+	bw, 
+# move_insert_mode (mir)?
+# move_standout_mode
+	msgr, 
+# init_tabs
+	it#8, 
+# screen geometry
+	lines#25, cols#80, colors#2, 
+# bell
+	bel=^G, 
+# cursor_invisible, cursor_normal
+	civis=^B, cnorm=^C, 
+# clear_screen
+	clear=^L, 
+# carriage_return
+	cr=^M, 
+# change_scroll_region (csr)?
+# cursor_left, cursor_down, cursor_right, cursor_up
+	cub1=^H, cud1=^J, cuf1=^\, cuu1=^K, 
+# cursor_address
+	cup=^_%p2%{32}%+%c%p1%{32}%+%c, 
+# delete_character (dch1)?
+# delete_line (dl1)?
+# clr_eos, clr_eol, clr_bol
+	ed=^T, el=^R, el1=^Q, 
+# flash_screen (flash)?
+# cursor_home
+	home=^^, 
+# tab
+	ht=^I, 
+# insert_character (ich1)?
+# insert_line (il1)?
+# scroll_forward, scroll_reverse (^M needed in case cursor off)
+	ind=^J^M, ri=^K^M, 
+# key_backspace, key_dc, key_ic
+	kbs=\177, kdch1=\E[3~, kich1=\E[2~, 
+# key_left, key_down, key_right, key_up
+	kcub1=\E[D, kcud1=\E[B, kcuf1=\E[C, kcuu1=\E[A, 
+# key_npage, key_ppage
+	knp=\E[6~, kpp=\E[5~, 
+# key_home, key_end
+	khome=\E[1~, kend=\E[4~, 
+# key_suspend
+	kspd=^Z, 
+# newline
+	nel=^M^J, 
+# set_a_foreground, set_a_background
+	setaf=^A, setab=^A, 
+# set_attributes
+	sgr=%?%p1%p3%|%t^X%;%?%p9%t^A%;, 
+# enter_reverse_mode, exit_attribute_mode
+	rev=^X, sgr0=^Y, 
+# reset1_string
+	rs1=^Y, 
+# enter_standout_mode, exit_standout_mode
+	smso=^X, rmso=^Y, 
+# enter_alt_charset_mode, exit_alt_charset_mode
+	smacs=^A, rmacs=^A, 
+# acs_chars
+	acsc=`\343a\177f\201g\253j\231k\234l\226m\223n\237o\320q\232s\322t\227u\235v\233w\236x\225~\220\,\362+\363-\360.\361h\3170\217{\270}\243, 

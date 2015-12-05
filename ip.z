@@ -1,0 +1,389 @@
+; CPC/IP IP layer
+; Copyright (c) 1999-2001 Mark RISON
+
+
+IP_VERIHL	equ	0
+IP_TOS		equ	1
+
+IP_LEN1		equ	2
+IP_LEN0		equ	3
+
+IP_ID1		equ	4
+IP_ID0		equ	5
+
+IP_FRG1		equ	6
+IP_FRG0		equ	7
+
+IP_TTL		equ	8
+IP_PRT		equ	9
+
+IP_CSM1		equ	10
+IP_CSM0		equ	11
+
+IP_SRC3		equ	12
+IP_SRC2		equ	13
+IP_SRC1		equ	14
+IP_SRC0		equ	15
+
+IP_DST3		equ	16
+IP_DST2		equ	17
+IP_DST1		equ	18
+IP_DST0		equ	19
+
+IP_HDRSIZE	equ	20
+
+IP_ICMP		equ	1	; Values for IP_PRT
+IP_TCP		equ	6
+IP_UDP		equ	17
+
+IP_DF		equ	&40	; Values for IP_FRG1
+IP_MF		equ	&20
+
+IP_DEFAULT_VERIHL equ	&45	; IPv4, no options
+IP_DEFAULT_TTL	equ	64	; See RFC1122 (3.2.1.7) and RFC1700
+
+LOOPBACK_ADDR	equ	127
+
+
+.ip_handle
+
+; Handle IP datagram from ipbuffer to (ipbufferinsert) - 1
+
+ld	hl, (ipbufferinsert)
+ld	(hl), 0			; Useful for checksums if odd number of octets
+ld	de, ipbuffer		; (always safe because ipbufferinsert <= ipbuffer + &3ff)
+or	a
+sbc	hl, de			; HL = # of IP octets received
+ret	z			; Always quietly dump zero-len
+
+; Are we in fact dealing with IPv4?
+
+ld	a, (ipbuffer + IP_VERIHL)
+ld	d, a
+and	&f0
+cp	&40
+jp	nz, ip_notv4
+
+; The minimal IPv4 header size is 20
+
+ld	a, d
+and	&0f
+rla
+rla
+cp	IP_HDRSIZE
+jr	c, ip_headertoosmall
+
+; The header can't occupy more than the whole datagram!
+
+inc	h
+dec	h
+jr	nz, ip_nottoosmall
+dec	a
+cp	l
+jp	nc, ip_headertoobig
+
+.ip_nottoosmall
+
+ld	ix, ipbuffer		; IX = base of IP octets
+
+; Fragmentation is not supported
+; This makes this IP implementation not RFC1122-compliant (3.3.2)
+; (Not handling options also does (3.2.1.8))
+; COULD add option-handling
+
+ld	a, (ipbuffer + IP_FRG1)
+and	&3f			; Fragment offset and MF bit should all be zero
+or	(ix + IP_FRG0)
+jp	nz, ip_fragmented
+
+; Does the received datagram size match the declared size?
+; (Assuming no fragmentation)
+
+ld	d, (ix + IP_LEN1)
+ld	e, (ix + IP_LEN0)
+ex	de, hl
+sbc	hl, de			; C clear before because of OR above
+ex	de, hl
+jp	nz, ip_sizemismatch
+
+; Check the checksum
+
+if	CHECKSUM_IP_IN
+call	cs_calcipchecksum
+jr	nz, ip_badchecksum
+endif
+
+; Quietly dump packet if sent to Class D or Class E address
+
+ld	a, (ipbuffer + IP_SRC3)
+or	&1f			; Class D/E start 1110/1111
+inc	a
+ret	z
+
+; FIXME should check correct destination for RFC1122-compliance (3.2.1.3)
+; (perhaps just dump anything which isn't exactly our host address)
+
+; It's looking good!
+
+if	SHOW_INFO
+call	ip_showinfo
+endif
+
+; On entry to the protocol handlers,
+; IX and HL have the IP datagram base and size respectively,
+; IY and DE have the IP payload base and size respectively;
+; the handlers may assume the IP datagram is valid, and corrupt all registers
+
+ld	a, (ipbuffer + IP_VERIHL)
+and	&0f
+rla
+rla
+ld	d, 0
+ld	e, a
+push	ix
+pop	iy
+add	iy, de			; IY = base of data octets
+push	hl
+sbc	hl, de			; C clear before because of ADD
+ex	de, hl			; DE = # of data octets
+pop	hl
+
+; Dispatch
+
+ld	a, (ipbuffer + IP_PRT)
+cp	IP_ICMP
+jp	z, icmp
+if	TCP
+cp	IP_TCP
+jp	z, tcp_
+endif
+if	UDP
+cp	IP_UDP
+jp	z, udp_
+endif
+ld	a, ICMP_PROT_UNREACH
+jp	icmp_senddestunreach
+
+
+.ip_done
+
+ret
+
+
+if	CHECKSUM_IP_IN
+
+if	SHOW_ERROR
+
+.ip_badchecksum
+
+ex	de, hl
+call	printstringimm
+defb	"IP: bad checksum: &", 0
+jp	printhex2crlf
+
+else
+
+ip_badchecksum		equ	ip_done
+
+endif
+
+endif
+
+
+if	SHOW_ERROR
+
+.ip_headertoosmall
+
+call	printstringimm
+defb	"IP: header too small: ", 0
+jp	printdeccrlf
+
+.ip_headertoobig
+
+inc	a
+call	printstringimm
+defb	"IP: header bigger than datagram: declared &00", 0
+call	printhex
+call	printstringimm
+defb	" vs. actual &", 0
+ex	de, hl
+jp	printhex2crlf
+
+.ip_notv4
+
+call	printstringimm
+defb	"IP: not v4 but v", 0
+rrca
+rrca
+rrca
+rrca
+jp	printdeccrlf
+
+.ip_fragmented
+
+call	printstringimm
+defb	"IP: fragmented datagram received", CR, LF, 0
+ret
+
+.ip_sizemismatch
+
+call	printstringimm
+defb	"IP: datagram size mismatch: actual &", 0
+call	printhex2
+call	printstringimm
+defb	" vs declared &", 0
+add	hl, de
+jp	printhex2crlf
+
+else
+
+ip_headertoosmall	equ	ip_done
+ip_headertoobig		equ	ip_done
+ip_notv4		equ	ip_done
+ip_fragmented		equ	ip_done
+ip_sizemismatch		equ	ip_done
+
+endif
+
+
+if	SHOW_INFO
+
+.ip_showinfo
+
+push	hl
+
+if	SHOW_RAW_IN
+; That's already printed a blank line
+else
+call	printcrlf
+endif
+
+call	printstringimm
+defb	"IP: v4 datagram, size &", 0
+call	printhex2
+
+call	printstringimm
+defb	", protocol ", 0
+ld	a, (ipbuffer + IP_PRT)
+call	printdec
+
+call	printstringimm
+defb	", TOS ", 0
+ld	a, (ipbuffer + IP_TOS)
+call	printdec
+
+call	printstringimm
+defb	", TTL ", 0
+ld	a, (ipbuffer + IP_TTL)
+call	printdec
+
+ld	a, (ipbuffer + IP_VERIHL)
+and	&0f
+sub	5
+jr	z, ip_shownooptions
+rla
+rla
+call	printstringimm
+defb	", options size &", 0
+call	printhex
+.ip_shownooptions
+
+call	printstringimm
+defb	CR, LF, "IP: remote addr: ", 0
+ld	hl, ipbuffer + IP_SRC3
+call	printipaddr
+
+call	printstringimm
+defb	CR, LF, "IP: local addr:	  ", 0
+ld	hl, ipbuffer + IP_DST3
+call	printipaddr
+call	printcrlf
+
+pop	hl
+
+ret
+
+endif
+
+
+.ip_swapsrcdest
+
+; Swap source and destination addresses for IP header pointed at by IX
+; DE corrupted
+
+ld	d, (ix + IP_SRC3)
+ld	e, (ix + IP_DST3)
+ld	(ix + IP_SRC3), e
+ld	(ix + IP_DST3), d
+ld	d, (ix + IP_SRC2)
+ld	e, (ix + IP_DST2)
+ld	(ix + IP_SRC2), e
+ld	(ix + IP_DST2), d
+ld	d, (ix + IP_SRC1)
+ld	e, (ix + IP_DST1)
+ld	(ix + IP_SRC1), e
+ld	(ix + IP_DST1), d
+ld	d, (ix + IP_SRC0)
+ld	e, (ix + IP_DST0)
+ld	(ix + IP_SRC0), e
+ld	(ix + IP_DST0), d
+
+ret
+
+
+.ip_getID
+
+; Get next value for the IP ID field
+;
+; On exit:
+;	HL = identification number
+;
+; The ID field is incrememnted on every request, thereby
+; ensuring uniqueness within &10000 requests, and so the MSL.
+
+ld	hl, (ip_ID)
+inc	hl
+ld	(ip_ID), hl
+
+ret
+
+.ip_ID
+
+defw	0
+
+
+.ip_getranduserport
+
+; Get "random" port in the user range (>= 1024)
+;
+; On exit:
+;	HL = byte-swapped port number
+;
+; The port number is unique with approximately second granularity
+; and with approximately 8 hours' timespan
+;
+; The return value is byte-swapped so it can be written little-endianly
+
+push	af
+push	de
+
+call	KL_TIME_PLEASE		; DEHL = time in 1/300 s
+ld	l, e			; LH = time in 256 / 300 s
+
+ld	a, l			; At least 1024?
+and	&fc
+jr	nz, ip_getranduserport_ok
+
+set	7, l			; No?  Then set b15
+
+.ip_getranduserport_ok
+
+pop	de
+pop	af
+
+ret
+
+
+.ipbufferinsert
+
+defw	ipbuffer

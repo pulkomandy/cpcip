@@ -1,0 +1,1841 @@
+; CPC/IP PPP layer
+; Copyright (c) 2000-2001 Mark RISON
+
+
+; See RFC1661, RFC1662 for PPP and LCP
+; See RFC1332, RFC1877 for IPCP
+; See RFC1334 for PAP (note this has been obsoleted by CHAP!)
+
+
+; LCP negotiation:
+; - Accept AP but nak if not PAP
+; - Accept ACCM iff zero, else reject
+; - Reject all other options
+; - Request MRU 1021 and ACCM 0
+; - Negotiating and using PFC and ACFC does not seem worth the effort!
+
+; IPCP negotiation:
+; - Accept IPADDR but ignore it
+; - Reject all other options
+; - Request IPADDR and PDNSADDR to get our and our name server's addresses
+
+
+; Some implementations have the following bug:
+;
+; When they accept a LCP_CONF_REQ <ACCM=0>, they send the LCP_CONF_ACK
+; where the sending ACCM is already zero, i.e. the control octet is a bare
+; 0x03.  Unfortunately, this is filtered out because we haven't yet seen
+; the LCP_CONF_ACK, so we think our receiving ACCM is still the default
+; (0xffffffff), and RFC1662 states that:
+;
+;	When octets are received which are flagged in the Async-
+;	Control-Character-Map, they are discarded before calculating
+;	the FCS.
+;
+; In any case, they're violating RFC1661:
+;
+;	Regardless of which Configuration Options are enabled, all LCP Link
+;	Configuration, Link Termination, and Code-Reject packets (codes 1
+;	through 7) are always sent as if no Configuration Options were
+;	negotiated.
+;
+; To work around this, we can behave as if the receiving ACCM is zero
+; until such time as our ACCM=0 request is rejected.  This workaround
+; will fail if the remote side sends us spurious control characters.
+
+PPPLCPACCMBUGWORKAROUND	equ	TRUE
+
+
+; FIXME should check Identifiers
+; FIXME should have a bit of state to do a bit of loop prevention
+; FIXME timeouts and retries would be nice
+; FIXME could check lengths for najected options
+
+
+; PPP asynchronous HDLC framing constants (RFC1662)
+
+PPP_FLAG	equ	&7e
+PPP_ADDR	equ	&ff
+PPP_CTRL	equ	&03
+PPP_ESC		equ	&7d
+PPP_ESC_XOR	equ	&20
+PPP_FCS16_INIT	equ	&ffff
+PPP_FCS16_GOOD	equ	&f0b8
+PPP_FCS16_ACF	equ	&3de3	; The FCS for ADDR followed by CTRL
+PPP_MRU		equ	&3ff - 2; Allow for FCS
+
+; PPP protocol values (RFC1700)
+
+PPP_TORP_IP	equ	&2100	; Byte-swapped versions
+PPP_TORP_IPCP	equ	&2180
+PPP_TORP_LCP	equ	&21c0
+PPP_TORP_PAP	equ	&23c0
+PPP_TORP_CHAP	equ	&23c2	; Unsupported!
+PPP_TORP_CCP	equ	&fd80	; Unsupported!
+PPP_TORP_EAP	equ	&27c2	; Unsupported!
+
+; LCP packet codes (RFC1661)
+; Some also used by PAP and IPCP (RFC1334, RFC1332)
+
+PPP_CONF_REQ	equ	1
+PPP_CONF_ACK	equ	2
+PPP_CONF_NAK	equ	3
+PPP_CONF_REJ	equ	4
+PPP_TERM_REQ	equ	5
+PPP_TERM_ACK	equ	6
+PPP_CODE_REJ	equ	7
+PPP_PROT_REJ	equ	8
+PPP_ECHO_REQ	equ	9
+PPP_ECHO_REP	equ	10
+PPP_DCRD_REQ	equ	11
+
+; PAP packet codes (RFC1334)
+
+PAP_AUTH_REQ	equ	1
+PAP_AUTH_ACK	equ	2
+PAP_AUTH_NAK	equ	3
+
+; LCP and IPCP payload offsets (RFC1661, RFC1332)
+
+PPP_OFFSETOF_CODE	equ	0
+PPP_OFFSETOF_IDENTIFIER	equ	1
+PPP_OFFSETOF_LEN1	equ	2
+PPP_OFFSETOF_LEN0	equ	3
+PPP_OFFSETOF_DATA	equ	4
+
+; LCP configuration options (RFC1661, RFC1662)
+
+LCP_MRU		equ	1
+LCP_ACCM	equ	2
+LCP_AP		equ	3
+LCP_QP		equ	4
+LCP_MN		equ	5
+LCP_PFC		equ	7
+LCP_ACFC	equ	8
+
+; IPCP configuration options (RFC1332, RFC1877)
+
+IPCP_IPCP	equ	2
+IPCP_IPADDR	equ	3
+IPCP_PDNSADDR	equ	129
+IPCP_SDNSADDR	equ	131
+
+
+.datalink_flags
+
+defb	0
+
+PPP_UP_BIT	equ	7
+PPP_INESC_BIT	equ	6
+PPP_OPEN_BIT	equ	0
+
+.lcp_configure_accm_out
+
+defb	0
+
+PPP_NET_LAYER_PROT_BIT	equ	7	; Must be 7 (because use RLA)
+PPP_ZERO_ACCM_OUT_BIT	equ	6	; Must be 6 (because use RLA)
+
+.lcp_configure_accm_in
+
+defb	0
+
+PPP_ZERO_ACCM_IN_BIT	equ	7	; Must be 7 (because use RLA)
+PPP_LCP_MRU_OUT_BIT	equ	6
+PPP_LCP_ACCM_OUT_BIT	equ	5
+PPP_IPCP_IPADDR_OUT_BIT	equ	4
+PPP_IPCP_PDNSADDR_OUT_BIT equ	3
+
+
+.datalink_isup
+
+bit	PPP_UP_BIT, (hl)
+ret
+
+
+.datalink_isopen
+
+bit	PPP_OPEN_BIT, (hl)
+ret
+
+
+.datalink_up
+
+set	PPP_UP_BIT, (hl)
+call	printstringimm
+defb	BS, "PPP: link up", CR, LF, 0	; BS eats up PPP_FLAG (~)
+
+ld	hl, 1			; PPP_ADDR just received
+ld	(ipbufferinsert), hl
+ld	a, PPP_ADDR
+ld	(ppp_header), a
+
+ret
+
+
+.datalink_toggle
+
+bit	PPP_UP_BIT, (hl)
+jr	z, ppp_tickle
+
+call	printcrlfmaybe
+call	printstringimm
+defb	"PPP: link down", CR, LF, 0
+
+.ppp_reinit
+
+xor	a
+ld	(datalink_flags), a
+ld	(lcp_configure_accm_out), a
+ld	(lcp_configure_accm_in), a
+
+ret
+
+.ppp_tickle
+
+call	printcrlfmaybe
+call	printstringimm
+defb	"PPP: link tickled", CR, LF, 0
+
+ld	hl, ppp_tickle_pkt
+ld	b, 8
+
+.ppp_tickle_send
+
+ld	a, (hl)
+inc	hl
+call	serial_putchar
+djnz	ppp_tickle_send
+
+ret
+
+.ppp_tickle_pkt			; See RFC1662 (B)
+
+defb	&7e, &7d, &df, &7d, &23, &c0, &21, &7e
+
+
+.datalink_isempty
+
+ld	hl, (ipbufferinsert)
+ld	a, h
+or	l
+sub	1
+ccf				; Carry clear iff (ipbufferinsert) zero
+
+ret
+
+
+.datalink_handlechar
+
+cp	PPP_FLAG		; Note different philosophy to SLIP where
+jr	z, ppp_eop		; SLIP_ESC SLIP_END is not recognised as EOP
+
+ld	d, a			; If the ACCM in is zero, controls are OK
+ld	a, (lcp_configure_accm_in)
+rla				; PPP_ZERO_ACCM_IN_BIT
+ld	a, d
+if	PPPLCPACCMBUGWORKAROUND
+jr	nc, ppp_handlechar_accminzero
+else
+jr	c, ppp_handlechar_accminzero
+endif
+
+cp	&20			; Discard any control chars
+ret	c
+
+.ppp_handlechar_accminzero
+
+bit	PPP_INESC_BIT, (hl)
+jr	nz, ppp_inesc
+
+cp	PPP_ESC
+jr	z, ppp_intoesc
+
+.ppp_wasesc
+
+ld	hl, (ipbufferinsert)
+inc	h			; If MSB is zero, we're still in the header
+dec	h
+jr	z, ppp_isheader
+
+ld	(hl), a
+inc	hl
+bit	2, h
+
+ret	nz
+
+.ppp_washeader
+
+ld	(ipbufferinsert), hl
+
+ret
+
+.ppp_isheader
+
+ld	de, ppp_header
+ex	de, hl
+add	hl, de
+ld	(hl), a
+ex	de, hl
+
+inc	l			; Know if in header HL < 4 so H == 0
+ld	a, l
+cp	4			; If/when do header compression, tweak here!
+jr	nz, ppp_washeader
+
+ld	hl, ipbuffer
+jr	ppp_washeader
+
+.ppp_inesc
+
+res	PPP_INESC_BIT, (hl)
+xor	PPP_ESC_XOR
+jr	ppp_wasesc
+
+.ppp_intoesc
+
+set	PPP_INESC_BIT, (hl)
+ret
+
+.ppp_header
+
+defs	4			; Space for ADDR, CTRL, PROT
+
+
+.ppp_eop
+
+; Check for unbalanced escape
+
+bit	PPP_INESC_BIT, (hl)
+jr	nz, ppp_badframing
+
+; Check if still in header
+
+ld	a, (ipbufferinsert + 1)
+or	a
+jr	z, ppp_tooshort
+
+; Check ADDR and CTRL fields in header
+
+ld	hl, (ppp_header)
+ld	de, PPP_CTRL * 256 or PPP_ADDR
+call	cphlde
+jp	nz, ppp_badacf
+
+; Compute header partial FCS
+
+if	CHECKSUM_PPP_IN
+ld	hl, ppp_header + 2
+ld	de, PPP_FCS16_ACF
+ld	bc, 2
+call	ppp_fcs16
+endif
+
+; Get packet size, making sure a FCS is present
+
+ld	hl, (ipbufferinsert)
+dec	hl			; Disregard FCS
+dec	hl
+ld	(ipbufferinsert), hl	; Update so FCS disregarded by IP layer
+ld	bc, ipbuffer
+or	a
+sbc	hl, bc
+jr	c, ppp_tooshort2	; FCS not present
+;FIXME ret z and remove check from IP layer, passing in len in hl
+;but need push hl;ld bc,ipbuffer;add hl,bc;ld (hl),0;pop hl
+;or maybe ld de,ipbuffer;ex de,hl;add hl,de;ld (hl),0;ex de,hl
+
+; Perform the FCS check
+
+if	CHECKSUM_PPP_IN
+push	hl
+ld	b, h
+ld	c, l
+inc	bc			; Include FCS in checksum calculation
+inc	bc
+ld	hl, ipbuffer
+call	ppp_fcs16
+ld	hl, PPP_FCS16_GOOD
+call	cphlde
+pop	hl
+jr	nz, ppp_badfcs
+endif
+
+; It's looking good!
+
+push	hl
+
+if	SHOW_INFO
+call	ppp_showinfo
+endif
+
+if	SHOW_RAW_IN
+call	ppp_showraw
+endif
+
+pop	bc
+ld	hl, (ppp_header + 2)
+
+call	ppp_dispatch
+
+.ppp_done
+.datalink_sop
+
+ld	hl, 0
+ld	(ipbufferinsert), hl
+
+ret
+
+
+if	SHOW_ERROR
+
+.ppp_badframing
+
+call	printstringimm
+defb	"PPP: bad framing", CR, LF, 0
+res	PPP_INESC_BIT, (hl)
+jr	ppp_done
+
+.ppp_tooshort
+
+ld	a, (ipbufferinsert)
+or	a
+jr	z, ppp_done		; Always quietly dump zero-len
+
+.ppp_tooshort3
+
+call	printstringimm
+defb	"PPP: packet too short: ", 0
+call	printdeccrlf
+jr	ppp_done
+
+.ppp_tooshort2
+
+ld	a, l
+add	a, 6			; Take account of expected header and FCS
+jr	ppp_tooshort3
+
+.ppp_badacf
+
+call	printstringimm
+defb	"PPP: bad ACF: ", 0
+ld	a, l
+ld	l, h
+ld	h, a
+call	printhex2crlf
+jr	ppp_done
+
+.ppp_badfcs
+
+call	printstringimm
+defb	"PPP: bad FCS: &", 0
+ex	de, hl
+call	printhex2crlf
+jr	ppp_done
+
+else
+
+ppp_tooshort	equ	ppp_done
+ppp_tooshort2	equ	ppp_done
+ppp_badacf	equ	ppp_done
+ppp_badfcs	equ	ppp_done
+
+.ppp_badframing
+
+res	PPP_INESC_BIT, (hl)
+jr	ppp_done
+
+endif
+
+
+if	SHOW_INFO
+
+.ppp_showinfo
+
+call	printstringimm
+defb	"PPP: packet, protocol &", 0
+ex	de, hl
+ld	hl, (ppp_header + 2)
+ld	a, h
+ld	h, l
+ld	l, a
+
+if	SHOW_RAW_IN
+
+call	printhex2crlf
+ex	de, hl
+ret
+
+else
+
+call	printstringimm
+defb	", size &", 0
+ex	de, hl
+jp	printhex2crlf
+
+endif
+
+endif
+
+
+if	SHOW_RAW_IN
+
+.ppp_showraw
+
+ld	b, h
+ld	c, l
+inc	bc			; Want to see FCS (note one extra print at end)
+
+call	printstringimm
+defb	CR, LF, "[ ", 0
+ld	hl, (ppp_header + 2)
+ld	a, h
+ld	h, l
+ld	l, a
+call	printhex2
+ex	de, hl
+ld	hl, ipbuffer
+
+.ppp_showraw_loop
+
+call	printstringimm
+defb	" ", 0
+ld	a, (hl)
+inc	hl
+call	printhex
+dec	bc
+ld	a, b
+or	c
+jr	nz, ppp_showraw_loop
+
+ld	a, (hl)
+call	printhex
+
+call	printstringimm
+defb	" ]", CR, LF, 0
+
+ret
+
+endif
+
+
+.ppp_dispatch
+
+; OK, what protocol have we received?
+
+ld	de, PPP_TORP_IP
+call	cphlde
+jp	z, ip_handle
+
+ld	de, PPP_TORP_LCP
+call	cphlde
+jp	z, lcp_handle
+
+ld	de, PPP_TORP_IPCP
+call	cphlde
+jp	z, ipcp_handle
+
+ld	de, PPP_TORP_PAP
+call	cphlde
+jp	z, pap_handle
+
+; Bah, what sort of a protocol is this?  Send a Protocol-Reject
+
+if	SHOW_ERROR or SHOW_PPP
+call	printstringimm
+defb	"PPP: unknown protocol: &", 0
+ld	a, h
+ld	h, l
+ld	l, a
+call	printhex2crlf
+endif
+
+; Fill in the Rejected-Information field
+
+push	bc
+
+ld	hl, ipbuffer + &3ff - 6
+ld	de, ipbuffer + &3ff
+ld	bc, &400 - 6		; Slow but safe if reject large pkt
+lddr
+
+; Fill in the Rejected-Protocol field
+
+ld	hl, (ppp_header + 2)
+ld	(ipbuffer + PPP_OFFSETOF_DATA), hl
+
+; Fill in the Code and Identifier fields
+
+ld	a, (lcp_prot_rej_identifier)
+inc	a
+ld	(lcp_prot_rej_identifier), a
+ld	h, a
+ld	l, PPP_PROT_REJ
+ld	(ipbuffer + PPP_OFFSETOF_CODE), hl
+
+; Fill in the Length field
+
+pop	hl
+
+ld	de, PPP_OFFSETOF_DATA + 2
+add	hl, de
+ld	a, h
+ld	h, l
+ld	l, a
+ld	(ipbuffer + PPP_OFFSETOF_LEN1), hl
+
+; Send the Protocol-Reject
+
+.ppp_sendlcppacket		; Byte-swapped len in BC, pkt at ipbuffer
+
+ld	b, l			; Inversion intentional
+ld	c, h
+ld	hl, PPP_TORP_LCP
+ld	ix, ipbuffer
+jp	ppp_sendpacket
+
+.lcp_prot_rej_identifier
+
+defb	&42
+
+
+.ppp_configure_naject		; Nak/Reject
+
+; On entry:
+;	IX = option-parsing handler
+; On exit:
+;	AF, BC, DE, HL, IX corrupted
+;
+; For handler:
+; FIXME describe
+; On entry:
+;	A = type
+;	HL -> length octet of option (followed by data)
+; On exit:
+;	AF, BC, DE, HL corrupt
+
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+ld	b, l			; Inversion intentional
+ld	c, h
+dec	bc
+dec	bc
+dec	bc
+dec	bc
+ld	hl, ipbuffer + PPP_OFFSETOF_DATA
+jr	ppp_configure_naject_parsestart
+
+.ppp_configure_naject_parseoptions
+
+inc	hl
+ld	a, (hl)			; Length field
+cp	2			; Invalid length?
+ret	c			; Return with Carry set
+
+push	de
+ld	d, a
+ld	a, c
+sub	d
+ld	c, a
+ld	a, b
+sbc	a, 0			; Overrun?
+ld	b, a
+pop	de
+ret	c			; Return with Carry set
+
+dec	hl
+ld	a, (hl)			; Type field
+inc	hl			; Point at Length field
+push	bc
+push	hl
+call	callix
+pop	hl
+pop	bc
+
+ld	a, (hl)			; Length field
+dec	hl
+
+add	a, l
+ld	l, a
+ld	a, h
+adc	a, 0
+ld	h, a
+
+.ppp_configure_naject_parsestart
+
+ld	a, b
+or	c
+jr	nz, ppp_configure_naject_parseoptions
+
+ret
+
+
+.ppp_configure_request
+
+; On entry:
+;	IX = option-checking handler
+; On exit:
+;	Carry clear if sent Configure-Ack
+;	AF, BC, DE, HL, IX corrupted
+;
+; For handler:
+; FIXME describe
+; On entry:
+;	A = type
+;	HL -> length octet of option (followed by data)
+;	DE -> end of response option list
+; On exit:
+;	AF, BC, HL corrupt
+;	DE potentially updated
+; Note can read/write (iptxbuffer).
+
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+ld	b, l			; Inversion intentional
+ld	c, h
+dec	bc
+dec	bc
+dec	bc
+dec	bc
+ld	hl, ipbuffer + PPP_OFFSETOF_DATA
+ld	de, iptxbuffer + PPP_OFFSETOF_DATA
+ld	a, (ipbuffer + PPP_OFFSETOF_IDENTIFIER)
+ld	(iptxbuffer + PPP_OFFSETOF_IDENTIFIER), a
+ld	a, PPP_CONF_ACK
+ld	(iptxbuffer + PPP_OFFSETOF_CODE), a
+jr	ppp_configure_request_checkstart
+
+.ppp_configure_request_checkoptions
+
+inc	hl
+ld	a, (hl)			; Length field
+cp	2			; Invalid length?
+ret	c			; Send nothing and return with Carry set
+
+push	de
+ld	d, a
+ld	a, c
+sub	d
+ld	c, a
+ld	a, b
+sbc	a, 0			; Overrun?
+ld	b, a
+pop	de
+ret	c			; Send nothing and return with Carry set
+
+dec	hl
+ld	a, (hl)			; Type field
+inc	hl			; Point at Length field
+push	bc
+push	hl
+call	callix
+pop	hl
+pop	bc
+
+ld	a, (hl)			; Length field
+dec	hl
+
+add	a, l
+ld	l, a
+ld	a, h
+adc	a, 0
+ld	h, a
+
+.ppp_configure_request_checkstart
+
+ld	a, b
+or	c
+jr	nz, ppp_configure_request_checkoptions
+
+; So, having gone through it all, do we want to reject, nak, or ack?
+
+ld	a, (iptxbuffer + PPP_OFFSETOF_CODE)
+cp	PPP_CONF_ACK
+jr	z, ppp_configure_request_ack
+
+; Send a Configure-Nak or Configure-Reject
+
+ex	de, hl
+ld	de, iptxbuffer + PPP_OFFSETOF_DATA
+or	a
+sbc	hl, de
+inc	hl			; Take account of header
+inc	hl
+inc	hl
+inc	hl
+
+; Fill in the Length field
+
+ld	a, h
+ld	h, l
+ld	l, a
+ld	(iptxbuffer + PPP_OFFSETOF_LEN1), hl
+
+; Send the Configure-Nak or Configure-Reject
+
+ld	b, l			; Inversion intentional
+ld	c, h
+ld	hl, (ppp_header + 2)	; Be careful if support PFC or ACFC!
+ld	ix, iptxbuffer
+call	ppp_sendpacket
+
+scf
+ret
+
+.ppp_configure_request_ack
+
+; Send a Configure-Ack
+
+ld	(ipbuffer + PPP_OFFSETOF_CODE), a
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+
+ld	b, l			; Inversion intentional
+ld	c, h
+ld	hl, (ppp_header + 2)	; Be careful if support PFC or ACFC!
+ld	ix, ipbuffer
+call	ppp_sendpacket
+
+xor	a
+ret
+
+
+.lcp_handle
+
+; FIXME check actual length compatible with PPP_OFFSETOF_LEN1
+
+if	SHOW_INFO or SHOW_PPP
+ld	a, (ipbuffer + PPP_OFFSETOF_CODE)
+if	SHOW_PPP
+cp	PPP_ECHO_REQ
+jr	z, lcp_handle_dontshowinfo
+endif
+call	printstringimm
+defb	"LCP: code ", 0
+call	printdec
+call	printstringimm
+defb	", length &", 0
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+ld	a, h
+ld	h, l
+ld	l, a
+call	printhex2crlf
+.lcp_handle_dontshowinfo
+endif
+
+; OK, what code have we received?
+
+ld	a, (ipbuffer + PPP_OFFSETOF_CODE)
+
+cp	PPP_DCRD_REQ
+ret	z
+
+cp	PPP_ECHO_REQ
+jr	z, lcp_echo_request
+
+cp	PPP_TERM_REQ
+jr	z, lcp_terminate_request
+
+cp	PPP_CONF_REQ
+jp	z, lcp_configure_request
+
+cp	PPP_CONF_ACK
+jr	z, lcp_configure_ack
+
+cp	PPP_CONF_NAK
+jp	z, lcp_configure_nak
+
+cp	PPP_CONF_REJ
+jp	z, lcp_configure_reject
+
+; Bah, what sort of a code is this?  FIXME Send a Code-Reject
+
+if	SHOW_ERROR or SHOW_PPP
+call	printstringimm
+defb	"LCP: unknown code: ", 0
+call	printdeccrlf
+endif
+
+ret
+
+
+.lcp_echo_request
+
+; Send an Echo-Reply
+
+ld	a, PPP_ECHO_REP
+ld	(ipbuffer + PPP_OFFSETOF_CODE), a
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+jp	ppp_sendlcppacket
+
+
+.lcp_configure_ack
+
+; Was our ACCM zero configure request accepted?
+
+ld	hl, lcp_configure_accm_in
+bit	PPP_LCP_ACCM_OUT_BIT, (hl)
+if	PPPLCPACCMBUGWORKAROUND
+jr	z, lcp_configure_ack_accmzerorejected
+else
+jr	nz, lcp_configure_ack_accmzerorejected
+endif
+
+set	PPP_ZERO_ACCM_IN_BIT, (hl)
+
+.lcp_configure_ack_accmzerorejected
+
+; Are we PAPing?
+
+ld	a, (lcp_configure_ap)
+or	a
+ret	z
+
+; Send an Authenticate-Request
+
+ld	a, (config_pap_auth_req_pkt + 1)	; Increment Identifier
+inc	a
+ld	(config_pap_auth_req_pkt + 1), a
+
+ld	hl, (config_pap_auth_req_pkt + 2)
+ld	b, l			; Inversion intentional
+ld	c, h
+ld	hl, PPP_TORP_PAP
+ld	ix, config_pap_auth_req_pkt
+jp	ppp_sendpacket
+
+
+.lcp_terminate_request
+
+; Notify the user
+
+call	printstringimm
+defb	"PPP: link terminated (", 0
+
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+ld	b, l			; Inversion intentional
+ld	c, h
+dec	bc
+dec	bc
+dec	bc
+ld	hl, ipbuffer + PPP_OFFSETOF_DATA
+jr	lcp_terminate_request_start
+
+.lcp_terminate_request_loop
+
+ld	a, (hl)
+inc	hl
+push	bc
+push	hl
+call	printcharsafe
+pop	hl
+pop	bc
+
+.lcp_terminate_request_start
+
+dec	bc
+ld	a, b
+or	c
+jr	nz, lcp_terminate_request_loop
+
+call	printstringimm
+defb	")", CR, LF, 0
+
+; Send a Terminate-Ack
+
+ld	a, (ipbuffer + PPP_OFFSETOF_IDENTIFIER)
+ld	(lcp_terminate_ack_pkt + PPP_OFFSETOF_IDENTIFIER), a
+ld	hl, PPP_TORP_LCP
+ld	bc, 4
+ld	ix, lcp_terminate_ack_pkt
+call	ppp_sendpacket
+
+jp	ppp_reinit
+
+.lcp_terminate_ack_pkt
+
+defb	PPP_TERM_ACK, 0, 0, 4	; Identifier field needs to be filled in
+
+
+.lcp_configure_request
+
+xor	a
+ld	(lcp_configure_ap), a
+ld	(lcp_configure_accm_out), a
+
+ld	ix, lcp_configure_request_checkoption
+call	ppp_configure_request
+
+ret	c
+
+jp	lcp_send_configure_request
+
+
+.lcp_configure_request_checkoption
+
+cp	LCP_ACCM
+jr	z, lcp_configure_request_checkaccm
+
+cp	LCP_AP
+jp	z, lcp_configure_request_checkap
+
+; Unsupported option -- reject
+
+if	SHOW_PPP
+call	printstringimm
+defb	"LCP: rejecting option ", 0
+call	printdeccrlf
+endif
+
+.lcp_configure_request_rejectoption
+
+ld	a, (iptxbuffer + PPP_OFFSETOF_CODE)
+cp	PPP_CONF_REJ
+jr	z, lcp_configure_request_alreadyrejecting
+
+ld	de, iptxbuffer + PPP_OFFSETOF_DATA
+ld	a, PPP_CONF_REJ
+ld	(iptxbuffer + PPP_OFFSETOF_CODE), a
+
+.lcp_configure_request_alreadyrejecting
+
+ld	c, (hl)			; Get Length
+ld	b, 0
+dec	hl
+ldir				; Copy option to reject
+ret
+
+.lcp_configure_request_checkaccm
+
+push	hl
+ld	a, (hl)			; Get Length
+inc	hl
+cp	6			; Should always be 6
+jr	nz, lcp_configure_request_rejectaccm
+
+ld	a, (hl)			; We can only accept a zero ACCM
+inc	hl
+or	(hl)
+inc	hl
+or	(hl)
+inc	hl
+or	(hl)
+pop	hl
+
+jr	nz, lcp_configure_request_rejectaccm
+
+if	SHOW_PPP
+call	printstringimm
+defb	"LCP: accepting zero ACCM", CR, LF, 0
+endif
+
+ld	hl, lcp_configure_accm_out
+set	PPP_ZERO_ACCM_OUT_BIT, (hl)
+
+ret
+
+.lcp_configure_request_rejectaccm
+
+if	SHOW_PPP
+call	printstringimm
+defb	"LCP: rejecting non-zero ACCM", CR, LF, 0
+endif
+
+jr	nz, lcp_configure_request_rejectoption
+
+.lcp_configure_request_checkap
+
+ld	a, (iptxbuffer + PPP_OFFSETOF_CODE)
+cp	PPP_CONF_REJ
+ret	z			; Do nothing if rejecting
+
+ld	a, (hl)			; Get Length
+inc	hl
+cp	4			; Should always be 4 if PAP
+jr	nz, lcp_configure_request_nakap
+
+push	hl
+ld	c, (hl)			; Get Authentication-Protocol
+inc	hl
+ld	b, (hl)
+ld	hl, lcp_configure_ap
+ld	(hl), c			; Note request for AP
+ld	hl, PPP_TORP_PAP	; Is it PAP?
+or	a
+sbc	hl, bc
+pop	hl
+
+jr	nz, lcp_configure_request_nakap
+
+if	SHOW_PPP
+call	printstringimm
+defb	"LCP: accepting PAP", CR, LF, 0
+endif
+
+ret
+
+.lcp_configure_request_nakap
+
+if	SHOW_PPP
+call	printstringimm
+defb	"LCP: naking AP &", 0
+ld	a, (hl)			; Get Authentication-Protocol
+inc	hl
+ld	l, (hl)
+ld	h, a
+call	printhex2crlf
+endif
+
+ld	hl, lcp_configure_request_papoption
+ld	a, PPP_CONF_NAK
+ld	(iptxbuffer + PPP_OFFSETOF_CODE), a
+ld	bc, 4
+ldir				; NAK Authentication-Protocol, asking for PAP
+
+ret
+
+.lcp_configure_request_papoption
+
+defb	LCP_AP, 4, PPP_TORP_PAP and &ff, PPP_TORP_PAP / 256
+
+.lcp_configure_ap
+
+defs	1			; Non-zero if AP requested by peer
+
+
+.lcp_configure_nak
+.lcp_configure_reject
+
+ld	ix, lcp_configure_naject_parseoption
+call	ppp_configure_naject
+
+.lcp_send_configure_request
+
+; Fill in the Code and Identifier fields
+
+ld	a, (lcp_conf_req_identifier)
+inc	a
+ld	(lcp_conf_req_identifier), a
+ld	h, a
+ld	l, PPP_CONF_REQ
+ld	(iptxbuffer + PPP_OFFSETOF_CODE), hl
+
+; Copy in the payload
+
+ld	de, iptxbuffer + PPP_OFFSETOF_DATA
+ld	a, (lcp_configure_accm_in)
+
+bit	PPP_LCP_MRU_OUT_BIT, a
+jr	nz, lcp_send_configure_req_notmru
+
+ld	bc, 4
+ld	hl, lcp_configure_request_mruoption
+ldir
+
+.lcp_send_configure_req_notmru
+
+bit	PPP_LCP_ACCM_OUT_BIT, a
+jr	nz, lcp_send_configure_req_notaccm
+
+ld	bc, 6
+ld	hl, lcp_configure_request_accmoption
+ldir
+
+.lcp_send_configure_req_notaccm
+
+ex	de, hl
+ld	de, iptxbuffer
+or	a
+sbc	hl, de
+ld	b, h
+ld	c, l
+ld	h, c			; Inversion intentional
+ld	l, b
+ld	(iptxbuffer + PPP_OFFSETOF_LEN1), hl
+
+; Send the Configure-Request
+
+ld	hl, PPP_TORP_LCP
+ld	ix, iptxbuffer
+jp	ppp_sendpacket
+
+.lcp_conf_req_identifier
+
+defb	&42
+
+.lcp_configure_request_mruoption
+
+defb	LCP_MRU, 4, PPP_MRU / 256, PPP_MRU and &ff
+
+.lcp_configure_request_accmoption
+
+defb	LCP_ACCM, 6, 0, 0, 0, 0
+
+
+.lcp_configure_naject_parseoption
+
+ld	hl, lcp_configure_accm_in
+
+cp	LCP_MRU
+jr	nz, lcp_configure_naject_notmru
+
+if	SHOW_PPP
+call	printstringimm
+defb	"LCP: MRU najected", CR, LF, 0
+endif
+
+set	PPP_LCP_MRU_OUT_BIT, (hl)
+
+ret
+
+.lcp_configure_naject_notmru
+
+cp	LCP_ACCM
+jr	nz, lcp_configure_naject_notaccm
+
+if	SHOW_PPP
+call	printstringimm
+defb	"LCP: ACCM najected", CR, LF, 0
+endif
+
+set	PPP_LCP_ACCM_OUT_BIT, (hl)
+
+ret
+
+.lcp_configure_naject_notaccm
+
+if	SHOW_ERROR or SHOW_PPP
+call	printstringimm
+defb	"LCP: naject for unexpected option ", 0
+call	printdeccrlf
+endif
+
+ret
+
+
+.ipcp_handle
+
+; FIXME check actual length compatible with PPP_OFFSETOF_LEN1
+
+if	SHOW_INFO or SHOW_PPP
+call	printstringimm
+defb	"IPCP: code ", 0
+ld	a, (ipbuffer + PPP_OFFSETOF_CODE)
+call	printdec
+call	printstringimm
+defb	", length &", 0
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+ld	a, h
+ld	h, l
+ld	l, a
+call	printhex2crlf
+endif
+
+; OK, what code have we received?
+
+ld	a, (ipbuffer + PPP_OFFSETOF_CODE)
+
+cp	PPP_CONF_REQ
+jp	z, ipcp_configure_request
+
+cp	PPP_CONF_ACK
+jp	z, ipcp_configure_ack
+
+cp	PPP_CONF_REJ
+jr	z, ipcp_configure_reject
+
+cp	PPP_CONF_NAK
+jp	z, ipcp_configure_nak
+
+; Bah, what sort of a code is this?  FIXME Send a Code-Reject
+; FIXME might just get a TERM_REQ (if remote wants to stop IP for any reason)
+
+if	SHOW_ERROR or SHOW_PPP
+call	printstringimm
+defb	"IPCP: unknown code: ", 0
+call	printdeccrlf
+endif
+
+ret
+
+
+.ipcp_configure_reject
+
+ld	ix, ipcp_configure_reject_parseoption
+call	ppp_configure_naject
+
+jp	ipcp_send_configure_request
+
+
+.ipcp_configure_reject_parseoption
+
+ld	hl, lcp_configure_accm_in
+
+cp	IPCP_IPADDR
+jr	nz, ipcp_configure_reject_notipaddr
+
+if	SHOW_PPP
+call	printstringimm
+defb	"IPCP: IPADDR rejected", CR, LF, 0
+endif
+
+set	PPP_IPCP_IPADDR_OUT_BIT, (hl)
+
+ret
+
+.ipcp_configure_reject_notipaddr
+
+cp	IPCP_PDNSADDR
+jr	nz, ipcp_configure_reject_notpdnsaddr
+
+if	SHOW_PPP
+call	printstringimm
+defb	"IPCP: PDNSADDR rejected", CR, LF, 0
+endif
+
+set	PPP_IPCP_PDNSADDR_OUT_BIT, (hl)
+
+ret
+
+.ipcp_configure_reject_notpdnsaddr
+
+if	SHOW_ERROR or SHOW_PPP
+call	printstringimm
+defb	"IPCP: reject for unexpected option ", 0
+call	printdeccrlf
+endif
+
+ret
+
+
+.ipcp_configure_ack
+
+ld	hl, datalink_flags
+set	PPP_OPEN_BIT, (hl)
+call	printstringimm
+defb	"PPP: link established", 0
+jp	keyb_displayprompt	; We're in!
+
+
+.ipcp_configure_nak
+
+ld	ix, ipcp_configure_nak_parseoption
+call	ppp_configure_naject
+
+jp	ipcp_send_configure_request
+
+
+.ipcp_configure_nak_parseoption
+
+cp	IPCP_IPADDR
+jr	nz, ipcp_configure_nak_notipaddr
+
+inc	hl
+ld	de, config_hostaddr
+ld	bc, 4
+ldir
+
+if	SHOW_PPP
+call	printstringimm
+defb	"IPCP: this host's IP address is ", 0
+ld	hl, config_hostaddr
+call	printipaddr
+call	printcrlf
+endif
+
+ret
+
+.ipcp_configure_nak_notipaddr
+
+cp	IPCP_PDNSADDR
+jr	nz, ipcp_configure_nak_notpdnsaddr
+
+inc	hl
+ld	de, config_nameserveraddr
+ld	bc, 4
+ldir
+
+if	SHOW_PPP
+call	printstringimm
+defb	"IPCP: the name server's IP address is ", 0
+ld	hl, config_nameserveraddr
+call	printipaddr
+call	printcrlf
+endif
+
+ret
+
+.ipcp_configure_nak_notpdnsaddr
+
+if	SHOW_ERROR or SHOW_PPP
+call	printstringimm
+defb	"IPCP: nak for unexpected option ", 0
+call	printdeccrlf
+endif
+
+ret
+
+
+.ipcp_configure_request
+
+ld	ix, ipcp_configure_request_checkoption
+call	ppp_configure_request
+
+ret	c
+
+
+.ipcp_send_configure_request
+
+; Fill in the Code and Identifier fields
+
+ld	a, (ipcp_conf_req_identifier)
+inc	a
+ld	(ipcp_conf_req_identifier), a
+ld	h, a
+ld	l, PPP_CONF_REQ
+ld	(iptxbuffer + PPP_OFFSETOF_CODE), hl
+
+; Copy in the payload
+
+ld	de, iptxbuffer + PPP_OFFSETOF_DATA
+ld	a, (lcp_configure_accm_in)
+
+bit	PPP_IPCP_IPADDR_OUT_BIT, a
+jr	nz, ipcp_send_configure_req_notipaddr
+
+ex	de, hl
+ld	(hl), IPCP_IPADDR
+inc	hl
+ld	(hl), 6
+inc	hl
+ex	de, hl
+ld	bc, 4
+ld	hl, config_hostaddr
+ldir
+
+.ipcp_send_configure_req_notipaddr
+
+bit	PPP_IPCP_PDNSADDR_OUT_BIT, a
+jr	nz, ipcp_send_configure_req_notpdnsaddr
+
+ex	de, hl
+ld	(hl), IPCP_PDNSADDR
+inc	hl
+ld	(hl), 6
+inc	hl
+ex	de, hl
+ld	bc, 4
+ld	hl, config_nameserveraddr
+ldir
+
+.ipcp_send_configure_req_notpdnsaddr
+
+ex	de, hl
+ld	de, iptxbuffer
+or	a
+sbc	hl, de
+ld	b, h
+ld	c, l
+ld	h, c			; Inversion intentional
+ld	l, b
+ld	(iptxbuffer + PPP_OFFSETOF_LEN1), hl
+
+; Send the Configure-Request
+
+ld	hl, PPP_TORP_IPCP
+ld	ix, iptxbuffer
+jp	ppp_sendpacket
+
+.ipcp_conf_req_identifier
+
+defb	&42
+
+
+.ipcp_configure_request_checkoption
+
+cp	IPCP_IPADDR
+ret	z			; COULD print out remote addr here
+
+; Unsupported option -- reject
+
+if	SHOW_PPP
+call	printstringimm
+defb	"IPCP: rejecting option ", 0
+call	printdeccrlf
+endif
+
+ld	a, (iptxbuffer + PPP_OFFSETOF_CODE)
+cp	PPP_CONF_REJ
+jr	z, ipcp_configure_request_alreadyrejecting
+
+ld	de, iptxbuffer + PPP_OFFSETOF_DATA
+ld	a, PPP_CONF_REJ
+ld	(iptxbuffer + PPP_OFFSETOF_CODE), a
+
+.ipcp_configure_request_alreadyrejecting
+
+ld	c, (hl)			; Get Length
+ld	b, 0
+dec	hl
+ldir				; Copy option to reject
+ret
+
+
+.pap_handle
+
+if	SHOW_INFO or SHOW_PPP
+call	printstringimm
+defb	"PAP: code ", 0
+ld	a, (ipbuffer + PPP_OFFSETOF_CODE)
+call	printdec
+call	printstringimm
+defb	", length &", 0
+ld	hl, (ipbuffer + PPP_OFFSETOF_LEN1)
+ld	a, h
+ld	h, l
+ld	l, a
+call	printhex2crlf
+endif
+
+; OK, what code have we received?
+
+ld	a, (ipbuffer + PPP_OFFSETOF_CODE)
+
+cp	PAP_AUTH_ACK
+jr	z, pap_auth_ack_handle
+
+cp	PAP_AUTH_NAK
+jr	z, pap_auth_nak_handle
+
+; Bah, what sort of a code is this?
+
+if	SHOW_ERROR or SHOW_PPP
+call	printstringimm
+defb	"PAP: unknown code: ", 0
+call	printdeccrlf
+endif
+
+ret
+
+
+.pap_auth_nak_handle
+
+call	printstringimm
+defb	"PAP: authentication failed (", 0
+
+jr	pap_auth_acknak_handle
+
+.pap_auth_ack_handle
+
+call	printstringimm
+defb	"PAP: authentication successful (", 0
+
+.pap_auth_acknak_handle
+
+ld	a, (ipbuffer + PPP_OFFSETOF_DATA)
+ld	b, a
+inc	b
+ld	hl, ipbuffer + PPP_OFFSETOF_DATA + 1
+jr	pap_auth_acknack_showmsg_start
+
+.pap_auth_acknak_showmsg
+
+ld	a, (hl)
+inc	hl
+
+push	bc
+push	hl
+call	printcharsafe
+pop	hl
+pop	bc
+
+.pap_auth_acknack_showmsg_start
+
+djnz	pap_auth_acknak_showmsg
+
+call	printstringimm
+defb	")", CR, LF, 0
+
+ret
+
+
+; fcs16 ppp_fcs16 (fcs, cp, len) as per RFC1662 (C.2)
+;
+; On entry:
+;	HL = cp
+;	DE = fcs16
+;	BC = len
+;
+; On exit:
+;	DE = updated fcs16
+;	AF, BC, HL corrupted
+
+.ppp_fcs16_loop
+
+dec	bc
+
+ld	a, (hl)
+inc	hl
+push	hl
+xor	e			; A = bracket = (fcs ^ *cp++) & 0xff
+
+if	PPP_FCSTAB16_PAGEALIGNED
+
+ld	h, pppfcstab16 / 256
+ld	l, a			; HL = &fcstab16_lsb[bracket]
+
+else
+
+add	a, pppfcstab16 and &ff
+ld	l, a
+ld	a, pppfcstab16 / 256
+adc	a, 0
+ld	h, a			; HL = &fcstab16_lsb[bracket]
+
+endif
+
+ld	a, (hl)			; A = LSB of fcstab[bracket]
+xor	d
+ld	e, a			; E = LSB of (fcs >> 8) ^ fcstab[bracket]
+inc	h			; HL = &fcstab16_msb[bracket]
+ld	d, (hl)			; D = MSB of (fcs >> 8) ^ fcstab[bracket] -- MSB of (fcs >> 8) always zero so irrelevant
+pop	hl
+
+.ppp_fcs16
+
+ld	a, b
+or	c
+jr	nz, ppp_fcs16_loop
+
+ret
+
+
+; fcs16 ppp_fcs16_single (fcs, c) as per RFC1662 (C.2)
+;
+; On entry:
+;	A = c
+;	DE = fcs16
+;
+; On exit:
+;	DE = updated fcs16
+;	AF, HL corrupted
+
+.ppp_fcs16_single
+
+xor	e			; A = bracket = (fcs ^ *cp++) & 0xff
+
+if	PPP_FCSTAB16_PAGEALIGNED
+
+ld	h, pppfcstab16 / 256
+ld	l, a			; HL = &fcstab16_lsb[bracket]
+
+else
+
+add	a, pppfcstab16 and &ff
+ld	l, a
+ld	a, pppfcstab16 / 256
+adc	a, 0
+ld	h, a			; HL = &fcstab16_lsb[bracket]
+
+endif
+
+ld	a, (hl)			; A = LSB of fcstab[bracket]
+xor	d
+ld	e, a			; E = LSB of (fcs >> 8) ^ fcstab[bracket]
+inc	h			; HL = &fcstab16_msb[bracket]
+ld	d, (hl)			; D = MSB of (fcs >> 8) ^ fcstab[bracket] -- MSB of (fcs >> 8) always zero so irrelevant
+
+ret
+
+
+.ppp_sendpacket
+
+; Send PPP packet of (byte-swapped) protocol HL
+; with payload of size BC with base IX
+; AF, BC, HL corrupted
+
+; FIXME do drop_out when timeouts implemented
+
+ld	a, l			; Check and store whether net-layer prot
+or	a
+
+ld	a, (lcp_configure_accm_out)
+res	PPP_NET_LAYER_PROT_BIT, a
+
+jr	nz, ppp_sendpacket_notnetlayerprot
+
+set	PPP_NET_LAYER_PROT_BIT, a
+
+.ppp_sendpacket_notnetlayerprot
+
+ld	(lcp_configure_accm_out), a
+
+ld	a, PPP_FLAG
+call	serial_putchar
+
+ld	a, PPP_ADDR
+call	serial_putchar
+ld	a, PPP_CTRL
+call	ppp_sendchar
+call	serial_putchar
+
+if	SHOW_RAW_OUT
+call	printstringimm
+defb	"{ ", 0
+endif
+
+ld	a, l
+if	SHOW_RAW_OUT
+call	printhex
+endif
+call	ppp_sendchar
+call	serial_putchar
+ld	a, h
+if	SHOW_RAW_OUT
+call	printhex
+endif
+call	ppp_sendchar
+call	serial_putchar
+
+push	bc
+push	hl
+
+push	ix
+pop	hl
+
+.ppp_sendpacket_more
+
+ld	a, (hl)
+inc	hl
+
+if	SHOW_RAW_OUT
+call	printstringimm
+defb	' ', 0
+call	printhex
+endif
+
+call	ppp_sendchar
+call	serial_putchar
+
+dec	bc
+ld	a, b
+or	c
+jr	nz, ppp_sendpacket_more
+
+ld	de, PPP_FCS16_ACF
+
+pop	hl
+ld	c, h
+ld	a, l
+call	ppp_fcs16_single
+ld	a, c
+call	ppp_fcs16_single
+
+pop	bc
+push	ix
+pop	hl
+call	ppp_fcs16
+
+ld	a, e
+cpl
+
+if	SHOW_RAW_OUT
+call	printstringimm
+defb	' ', 0
+call	printhex
+endif
+
+call	ppp_sendchar
+call	serial_putchar
+
+ld	a, d
+cpl
+
+if	SHOW_RAW_OUT
+call	printhex
+endif
+
+call	ppp_sendchar
+call	serial_putchar
+
+ld	a, PPP_FLAG
+call	serial_putchar
+
+if	SHOW_RAW_OUT
+call	printstringimm
+defb	" }", CR, LF, 0
+endif
+
+ret
+
+
+.ppp_sendchar
+
+cp	PPP_FLAG		; Must escape
+jr	z, ppp_sendpacket_escape
+
+cp	PPP_ESC			; Must escape
+jr	z, ppp_sendpacket_escape
+
+cp	&20			; No need to escape any non-controls
+ret	nc
+
+push	af
+
+ld	a, (lcp_configure_accm_out)
+rla				; PPP_NET_LAYER_PROT_BIT
+jr	nc, ppp_sendchar_escape2; Escape controls if not net-layer prot packet
+rla				; PPP_ZERO_ACCM_OUT_BIT
+jr	nc, ppp_sendchar_escape2; No need to escape controls if ACCM zero
+
+pop	af
+ret
+
+.ppp_sendpacket_escape
+
+push	af
+
+.ppp_sendchar_escape2
+
+ld	a, PPP_ESC
+call	serial_putchar
+pop	af
+xor	PPP_ESC_XOR
+
+ret
+
+
+.datalink_sendpacket
+.slip_sendpacket
+
+; Send packet of size BC with base IX
+; AF, BC, HL corrupted
+
+if	DROP_OUT
+ld	a, (ppp_send_drop)
+add	a, 256 / DROP_OUT
+ld	(ppp_send_drop), a
+ret	c
+endif
+
+; Check for loopback
+
+push	ix
+pop	hl
+
+if	LOOPBACK
+
+ld	a, (ix + IP_DST3)
+cp	LOOPBACK_ADDR
+jp	z, loopback_insert
+
+endif
+
+ld	hl, PPP_TORP_IP
+jp	ppp_sendpacket
+
+
+if	DROP_OUT
+
+.ppp_send_drop
+
+defb	0
+
+endif

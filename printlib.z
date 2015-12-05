@@ -1,0 +1,301 @@
+; CPC/IP print library
+; Copyright (c) 1999-2000 Mark RISON
+
+
+TAB_SPACING	equ	8	; Must be a power of 2
+
+
+.printhex2
+
+; printf ("%04x", HL)
+; All regs preserved
+
+push	af
+ld	a, h
+call	printhex
+ld	a, l
+call	printhex
+pop	af
+ret
+
+.printhex
+
+; printf ("%02x", A)
+; All regs preserved
+
+push	af
+and	&f0
+rrca
+rrca
+rrca
+rrca
+call	printhex_digit
+pop	af
+
+push	af
+and	&0f
+call	printhex_digit
+pop	af
+
+ret
+
+.printhex_digit
+
+cp	10
+jr	c, printhex_decdigit
+add	a, 'a' - '0' - 10
+
+.printhex_decdigit
+
+add	a, '0'
+jp	TXT_OUTPUT
+
+
+.printdec
+
+; printf ("%u", A)
+; All regs preserved
+
+push	hl
+ld	h, 0
+ld	l, a
+jr	printdec_skippush
+
+.printdec2
+
+; printf ("%u", HL)
+; All regs preserved
+
+push	hl
+
+.printdec_skippush
+
+push	af
+push	bc
+push	de
+push	ix
+
+ld	ix, printdec_pow10
+ld	b, 5
+ld	c, 0
+
+.printdec_nextdigit
+
+ld	d, (ix + 1)
+ld	e, (ix + 0)
+inc	ix
+inc	ix
+xor	a
+
+.printdec_divide
+
+inc	a
+sbc	hl, de
+jr	nc, printdec_divide
+add	hl, de
+
+dec	a
+jr	nz, printdec_not0
+
+bit	0, c
+jr	z, printdec_skipleading0
+
+.printdec_not0
+
+add	a, '0'
+call	TXT_OUTPUT
+set	0, c
+
+.printdec_skipleading0
+
+djnz	printdec_nextdigit
+
+bit	0, c
+jr	nz, printdec_notall0
+
+ld	a, '0'
+call	TXT_OUTPUT
+
+.printdec_notall0
+
+pop	ix
+pop	de
+pop	bc
+pop	af
+pop	hl
+
+ret
+
+.printdec_pow10
+
+defw	10000, 1000, 100, 10, 1
+
+
+.printstring
+
+; printf ("%s", HL)
+; HL set to point after terminating NUL
+
+push	af
+
+.printstring_loop
+
+ld	a, (hl)
+or	a
+call	nz, TXT_OUTPUT
+inc	hl
+jr	nz, printstring_loop
+
+pop	af
+
+ret
+
+
+.printstringsafe
+
+; printf ("%s", HL) without obeying control chars
+; HL set to point after terminating NUL
+
+push	af
+push	bc
+push	de
+
+.printstringsafe_loop
+
+ld	a, (hl)
+or	a
+push	hl
+call	nz, TXT_WR_CHAR
+pop	hl
+ld	a, (hl)
+or	a
+inc	hl
+jr	nz, printstringsafe_loop
+
+pop	de
+pop	bc
+pop	af
+
+ret
+
+
+printcharverysafe	equ	TXT_WR_CHAR
+
+; Print char in A as a normal character, even if it's a control character
+; AF, BC, DE, HL corrupted
+
+
+.printcharsafe
+
+; Like printcharverysafe except NUL, BEL, BS, TAB, LF, CR are obeyed
+; AF, BC, DE, HL corrupted
+
+or	a			; NUL?
+ret	z
+cp	CR			; CR?
+jp	z, TXT_OUTPUT
+cp	BEL			; Less than BEL (7)?
+jp	c, TXT_WR_CHAR
+cp	LF + 1			; More than LF (10)?
+jp	nc, TXT_WR_CHAR
+cp	TAB			; TAB?
+jp	nz, TXT_OUTPUT
+
+.printcs_tab
+
+call	TXT_GET_CURSOR
+and	TAB_SPACING - 1
+sub	TAB_SPACING
+neg
+ld	b, a
+ld	a, TAB			; Moves one char right
+
+.printcs_tab_loop
+
+call	TXT_OUTPUT
+djnz	printcs_tab_loop
+
+ret
+
+
+.printstringimm
+
+; Print NUL-terminated string starting at return address
+; All regs preserved
+
+ex	(sp), hl
+call	printstring
+ex	(sp), hl
+ret
+
+
+.printcrlf
+
+; printf ("\n")
+; All regs preserved
+
+push	af
+ld	a, CR
+call	TXT_OUTPUT
+ld	a, LF
+call	TXT_OUTPUT
+pop	af
+ret
+
+
+.printcrlfmaybe
+
+; Same as printcrlf, except do nothing if already at first column
+
+push	af
+push	hl
+call	TXT_GET_CURSOR
+or	a
+call	nz, printcrlf
+pop	hl
+pop	af
+ret
+
+
+.printipaddr
+
+; printf ("%s", IPtoString (HL))
+; All regs preserved
+
+push	af
+push	hl
+
+ld	a, (hl)
+call	printdecdot
+inc	hl
+ld	a, (hl)
+call	printdecdot
+inc	hl
+ld	a, (hl)
+call	printdecdot
+inc	hl
+ld	a, (hl)
+call	printdec
+
+pop	hl
+pop	af
+ret
+
+
+.printdecdot
+
+call	printdec
+ld	a, '.'
+jp	TXT_OUTPUT
+
+
+.printhex2crlf
+
+call	printhex2
+jr	printcrlf
+
+
+.printdeccrlf
+
+call	printdec
+jr	printcrlf

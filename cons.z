@@ -1,0 +1,182 @@
+; CPC/IP telnet console management
+; Copyright (c) 1999-2000 Mark RISON
+
+; A telnet console must export the following routines
+; (the entry/exit conditions are described here at the top of each):
+; cons_init, cons_final, cons_printchar
+
+; A telnet console may expect the following imported symbols:
+; NUL, BEL, BS, TAB, LF, CR, ESC, DEL
+
+
+SOH		equ	1	; (hijacked for ignore)
+STX		equ	2	; Disable cursor
+ETX		equ	3	; Enable cursor
+VT		equ	11	; Cursor up
+FF		equ	12	; Clear screen and home
+SO		equ	14	; Set paper
+SI		equ	15	; Set ink
+DC1		equ	17	; Clear to BOL
+DC2		equ	18	; Clear to EOL
+DC4		equ	20	; Clear to EOS
+CAN		equ	24	; (hijacked for stand-out)
+EM		equ	25	; (hijacked for normal)
+SUB_		equ	26	; (hijacked for FIXME scroll region)
+FS		equ	28	; (hijacked for cursor forward)
+GS		equ	29	; (hijacked for FIXME visible bell)
+RS		equ	30	; Home
+US		equ	31	; Locate
+
+
+.cons_init
+
+; Initialise telnet console layer
+;
+; On exit:
+;	AF, BC, DE, HL may be corrupted
+
+xor	a
+ld	(cons_incup), a
+ret
+
+
+.cons_printchar
+
+; Print a telnet console character
+;
+; On entry:
+;	A = character
+; On exit:
+;	AF, BC corrupted
+
+ld	b, a			; Cursor position parameters
+ld	a, (cons_incup)
+or	a
+jr	nz, cons_docup
+ld	a, b
+cp	' '
+jr	nc, cons_doit		; Printables
+;cp	SOH			; Reserved for ignore
+cp	TAB
+jr	z, cons_ht		; Horizontal tab
+cp	STX
+jr	z, cons_doit		; Cursor invisible
+cp	ETX
+jr	z, cons_doit		; Cursor visible
+cp	BEL			; All valid less than BEL already done;
+ret	c			; do bell, cursor back/up/down one,
+cp	CR + 1			; clear screen and carriage return
+jr	c, cons_doit		; (tab done above)
+cp	DC1
+jr	z, cons_doit		; Clear to BOL
+cp	DC2
+jr	z, cons_doit		; Clear to EOL
+cp	DC4
+jr	z, cons_doit		; Clear to EOS
+cp	CAN
+jr	z, cons_smso		; Set mode stand-out
+cp	EM
+jr	z, cons_rmso		; Reset mode stand-out
+;cp	SUB_			; Reserved for scroll region
+cp	FS
+jr	z, cons_cuf1		; Cursor forward one
+;cp	GS			; Reserved for visible bell
+cp	RS
+jr	z, cons_doit		; Cursor home
+cp	US
+jr	z, cons_cup		; Cursor update
+
+ret
+
+.cons_ht
+
+push	de
+push	hl
+call	printcharsafe
+pop	hl
+pop	de
+ret
+
+.cons_cuf1
+
+ld	a, TAB
+jr	cons_doit
+
+.cons_smso
+
+; Important to force to valid position, else you can get trouble
+; if the cursor is off (e.g. consider <LF> <change colours> x --
+; the newline only occurs at the x, so a coloured line appears!)
+
+call	cons_forcevalid
+call	printstringimm
+defb	SO, 1, SI, 16, 0	; 16 is a hack to get 0
+ret
+
+.cons_rmso
+
+call	cons_forcevalid
+call	printstringimm
+defb	SO, 16, SI, 1, 0	; 16 is a hack to get 0
+ret
+
+.cons_cup
+
+ld	a, 2
+ld	(cons_incup), a
+ret
+
+.cons_docup
+
+ld	a, (cons_incup)
+cp	2
+jr	z, cons_docup_storex
+xor	a
+ld	(cons_incup), a
+ld	a, US
+call	TXT_OUTPUT
+ld	a, (cons_incupX)
+sub	31
+call	TXT_OUTPUT
+ld	a, b
+sub	31
+
+.cons_doit
+
+jp	TXT_OUTPUT
+
+.cons_docup_storex
+
+dec	a
+ld	(cons_incup), a
+ld	a, b
+ld	(cons_incupX), a
+ret
+
+.cons_forcevalid
+
+TXT_PLACE_CURSOR equ	&bb8a
+TXT_REMOVE_CURSOR equ	&bb8d
+
+call	TXT_PLACE_CURSOR	; This trick may not work if the
+jp	TXT_REMOVE_CURSOR	; cursor is visible
+
+.cons_incup
+
+defs	1
+
+.cons_incupX
+
+defs	1
+
+
+.cons_final
+
+; Finalise telnet console layer
+;
+; On exit:
+;	AF, BC, DE, HL may be corrupted
+
+call	cons_rmso
+ld	a, ETX
+jp	TXT_OUTPUT

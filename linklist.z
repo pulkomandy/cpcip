@@ -1,0 +1,251 @@
+; CPC/IP linked-list management
+; Copyright (c) 1999-2001 Mark RISON
+
+
+; The linked-list nodes start with a word which contains
+; a pointer to the next node, or zero for the last one.
+
+
+.ll_insert
+
+; Insert node at head of linked list
+;
+; On entry:
+;	HL -> node to insert
+;	IX -> linked-list head
+;
+; On exit:
+;	DE corrupted
+;
+; Note no check is made that the given node isn't already
+; in the linked list -- ensure this doesn't happen!
+
+ld	d, (ix + 1)
+ld	e, (ix + 0)
+ld	(ix + 1), h
+ld	(ix + 0), l
+
+ld	(hl), e
+inc	hl
+ld	(hl), d
+dec	hl
+
+ret
+
+
+.ll_remove
+
+; Remove node from linked list
+;
+; On entry:
+;	HL -> node to remove
+;	IX -> linked-list head
+;
+; On exit:
+;	IX corrupted
+;
+; Note if the structure isn't in the linked list, nothing happens.
+
+push	af
+push	de
+
+.ll_remove_trynext
+
+ld	d, (ix + 1)
+ld	e, (ix + 0)
+ld	a, d
+or	e
+jr	z, ll_remove_notfound
+push	hl
+sbc	hl, de			; Note C cleared by OR above
+pop	hl
+jr	z, ll_remove_found
+push	de
+pop	ix
+jr	ll_remove_trynext
+
+.ll_remove_found
+
+ld	a, (de)
+ld	(ix + 0), a
+inc	de
+ld	a, (de)
+ld	(ix + 1), a
+
+.ll_remove_notfound
+
+pop	de
+pop	af
+
+ret
+
+
+UCP_OFFSETOF_REMADDR	equ	2
+UCP_OFFSETOF_REMPORT	equ	6
+UCP_OFFSETOF_LCLPORT	equ	8
+UCP_OFFSETOF_HANDLER	equ	10
+UCP_OFFSETOF_EXTRA	equ	12
+
+
+.ucp_dispatch
+
+; Dispatch a UDP/TCP packet
+;
+; On entry:
+;	IX -> IP header
+;	IY -> UDP/TCP header
+;	HL -> linked-list head
+;	(SP + 4) = return address if match found
+;	(SP + 2) = HL to pass to handler
+;	(SP + 0) = return address if no match found
+;
+; On exit:
+;	Routine just returns if no match is found
+;	Otherwise the handler is jumped to with:
+;		HL restored from stack
+;		BC -> any extra info
+;		DE, IX, IY preserved
+;		(SP + 0) = return address if match found
+;
+; Note it is expected that this function will be called like this:
+;
+;	push	hl
+;	ld	hl, (llhead)
+;	call	ucp_dispatch	; Doesn't return if found
+;	pop	hl
+;
+; Note the nodes used for the bind structure have this format:
+;
+;	word	next		(pointer to next node; system-maintained)
+;	dword	remaddr		(big-endian)
+;	word	remport		(big-endian)
+;	word	locport		(big-endian)
+;	word	handler		(little-endian)
+;	byte	extrainfo	(optional and opaque)
+;
+; The first octet of the remaddr and the two octets of the remport
+; may independently be set to all-zeroes to mean "any".
+; The octets of the remaddr and the remport may all be set to
+; all-ones to mean "none" (effectively temporarily suspending the bind).
+;
+; The same dispatcher can be used both for UDP and TCP
+; because they have the ports at the same offset.
+
+push	de
+jr	ucp_firstiteration
+
+.ucp_trymatch
+
+push	hl
+
+inc	hl
+inc	hl
+
+ld	a, (hl)			; HL -> remaddr
+inc	hl
+inc	hl
+inc	hl
+or	a
+jr	z, ucp_anyremaddr
+dec	hl
+dec	hl
+
+cp	(ix + IP_SRC3)
+jr	nz, ucp_nextclient
+ld	a, (hl)
+cp	(ix + IP_SRC2)
+jr	nz, ucp_nextclient
+inc	hl
+ld	a, (hl)
+cp	(ix + IP_SRC1)
+jr	nz, ucp_nextclient
+inc	hl
+ld	a, (hl)
+cp	(ix + IP_SRC0)
+jr	nz, ucp_nextclient
+
+.ucp_anyremaddr
+
+inc	hl
+ld	a, (hl)			; HL -> remport
+inc	hl
+or	(hl)
+jr	z, ucp_anyremport
+dec	hl
+
+ld	a, (hl)
+cp	(iy + UDP_SRC1)		; Could just as well have used TCP_*
+jr	nz, ucp_nextclient
+inc	hl
+ld	a, (hl)
+cp	(iy + UDP_SRC0)
+jr	nz, ucp_nextclient
+
+.ucp_anyremport
+
+inc	hl
+ld	a, (hl)			; HL -> destport
+cp	(iy + UDP_DST1)
+jr	nz, ucp_nextclient
+inc	hl
+ld	a, (hl)
+cp	(iy + UDP_DST0)
+jr	nz, ucp_nextclient
+
+; We've found a listener!
+
+inc	hl
+ld	e, (hl)
+inc	hl
+ld	d, (hl)			; DE = handler
+inc	hl
+ld	b, h
+ld	c, l			; BC -> extrainfo
+ex	de, hl			; HL = handler
+pop	de			; Drop top stacked HL
+pop	de			; Restore DE stacked on entry
+inc	sp			; Drop stacked return address
+inc	sp
+ex	(sp), hl		; Restore HL and stack address of handler
+
+ret				; Jump to handler
+
+.ucp_nextclient
+
+pop	hl
+ld	e, (hl)
+inc	hl
+ld	d, (hl)			; DE = next
+ex	de, hl
+
+.ucp_firstiteration
+
+ld	a, h
+or	l
+jr	nz, ucp_trymatch
+
+pop	de
+
+ret
+
+
+.ucp_swapsrcdest
+
+; Swap source and destination ports for UDP/TCP header
+;
+; On entry:
+;	IY -> UDP/TCP header
+;
+; On exit:
+;	DE corrupted
+
+ld	d, (iy + UDP_SRC1)
+ld	e, (iy + UDP_DST1)
+ld	(iy + UDP_SRC1), e
+ld	(iy + UDP_DST1), d
+ld	d, (iy + UDP_SRC0)
+ld	e, (iy + UDP_DST0)
+ld	(iy + UDP_SRC0), e
+ld	(iy + UDP_DST0), d
+
+ret

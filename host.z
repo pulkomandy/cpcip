@@ -1,0 +1,477 @@
+; CPC/IP host client
+; Copyright (c) 1999 Mark RISON
+
+
+.host_syntax
+
+call	printstringimm
+defb	"host ( [-m | -a] hostname ) | address", CR, LF, 0
+jp	keyb_client_done
+
+
+.host_init
+
+call	printstringimm
+defb	"host client initialised", CR, LF, 0
+ret
+
+
+.host_do
+
+; Check for absence of arguments
+
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	z, host_syntax
+
+; Initialise options
+
+ld	bc, 0
+ld	(host_host), bc
+ld	c, DNS_A
+ld	(host_qtype), bc
+
+.host_parse
+
+; Parse command line
+
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	z, host_parsed
+
+cp	SWITCH
+jr	z, host_switch
+
+; No switch?  It must be the host address
+
+ld	(host_host), hl
+call	util_skiptospace
+
+jr	host_parse
+
+.host_switch
+
+; Parse all the switches
+
+inc	hl
+ld	a, (hl)
+inc	hl
+
+; -m (MX records)
+
+cp	'm'
+jr	nz, host_notm
+
+ld	bc, DNS_MX
+ld	(host_qtype), bc
+jr	host_parse
+
+.host_notm
+
+; -a (all records)
+
+cp	'a'
+jr	nz, host_nota
+
+ld	bc, DNS_ALL
+ld	(host_qtype), bc
+jr	host_parse
+
+.host_nota
+
+; Well, what more do you want?
+
+jp	host_syntax
+
+
+.host_parsed
+
+; Make sure a host address was specified
+
+ld	hl, (host_host)
+ld	a, h
+or	l
+jp	z, host_syntax
+
+; Check for numeric host address
+
+ld	de, host_addr
+push	hl
+call	util_readdottedquad
+pop	hl
+jr	nz, host_notnumeric
+
+; It is!  Convert to suitable reverse lookup string
+
+ld	hl, host_reverselookup
+ld	a, (host_addr + 3)
+call	writedec
+ld	(hl), '.'
+inc	hl
+ld	a, (host_addr + 2)
+call	writedec
+ld	(hl), '.'
+inc	hl
+ld	a, (host_addr + 1)
+call	writedec
+ld	(hl), '.'
+inc	hl
+ld	a, (host_addr + 0)
+call	writedec
+ld	(hl), '.'
+inc	hl
+ex	de, hl
+ld	hl, host_inaddrarpa
+ld	bc, host_inaddrarpaend - host_inaddrarpa
+ldir
+
+; Force pointer lookup with string just generated
+
+ld	hl, DNS_PTR
+ld	(host_qtype), hl
+
+ld	hl, host_reverselookup
+
+.host_notnumeric
+
+; Register key handler (for CTRL-C)
+; Do this first in case resolver immediately comes back with an error
+
+ex	de, hl
+ld	hl, host_keyhandler
+call	keyb_client_doing
+ex	de, hl
+
+; Initialise the resolver handler
+
+xor	a
+ld	(host_ancount), a
+
+; Query the resolver
+
+ld	bc, (host_qtype)
+ld	de, host_resolved
+jp	resolv_query
+
+
+.host_resolved
+
+or	a			; DNS_NOERR
+jp	nz, host_resolved_abnormal
+
+ld	a, (host_ancount)
+inc	a
+ld	(host_ancount), a
+
+ld	bc, (host_qtype)
+ld	a, b
+or	a
+jr	nz, host_notptr
+ld	a, c
+cp	DNS_PTR
+jr	nz, host_notptr
+
+push	hl
+ld	hl, host_addr
+call	printipaddr
+call	printstringimm		; Mimic the trailing dot from host_printname
+defb	".", 0
+pop	hl
+jr	host_wasptr
+
+.host_notptr
+
+ex	de, hl
+call	host_printname
+ld	b, (hl)			; Get TYPE
+inc	hl
+ld	c, (hl)
+ex	de, hl
+
+.host_wasptr
+
+ld	a, b
+or	a
+jr	nz, host_resolved_unknown
+ld	a, c
+
+cp	DNS_MX
+jr	z, host_resolved_mailexchange
+
+ld	de, host_resolved_canonicalname
+cp	DNS_CNAME
+jr	z, host_resolved_printname
+
+ld	de, host_resolved_nameserver
+cp	DNS_NS
+jr	z, host_resolved_printname
+
+ld	de, host_resolved_pointer
+cp	DNS_PTR
+jr	z, host_resolved_printname
+
+cp	DNS_A
+jr	nz, host_resolved_unknown
+
+call	printstringimm
+defb	BS, " has address ", 0
+call	printipaddr
+call	printcrlf
+
+scf				; Want more
+ret
+
+.host_resolved_mailexchange
+
+call	printstringimm
+defb	BS, " has mail exchange, preference ", 0
+ld	d, (hl)
+inc	hl
+ld	e, (hl)
+inc	hl
+ex	de, hl
+call	printdec2
+ex	de, hl
+ld	de, host_resolved_exchange
+
+.host_resolved_printname
+
+ex	de, hl
+call	printstring
+ex	de, hl
+call	host_printname
+call	printcrlf
+
+scf				; Want more
+ret
+
+.host_resolved_unknown
+
+call	printstringimm
+defb	BS, " has a RR of type ", 0
+ld	h, b
+ld	l, c
+call	printdec2
+call	printcrlf
+
+scf				; Want more
+ret
+
+.host_resolved_abnormal
+
+inc	a			; DNS_NOMORE == &ff
+jr	nz, host_resolved_error
+
+ld	a, (host_ancount)
+or	a
+call	z, host_resolved_noanswers
+
+bit	DNS_RA_BIT, (iy + DNS_RFLAGS)
+ld	hl, host_resolved_notrecursive
+call	z, printstring
+
+jr	host_done
+
+.host_resolved_error
+
+call	printcrlfmaybe
+call	printstringimm
+defb	"Error resolving name, code &", 0
+dec	a
+call	printhex
+call	printcrlf
+
+.host_final
+.host_done
+
+; Give keyboard back to command line input
+
+call	keyb_client_done
+
+or	a			; Just in case we're falling through to here
+ret				; because RDLENGTH not four
+
+.host_resolved_noanswers
+
+ld	hl, (host_qtype)
+ld	de, DNS_PTR
+or	a
+sbc	hl, de
+jr	nz, host_resolved_noanswers_notptr
+
+ld	hl, host_addr
+call	printipaddr
+call	printstringimm
+defb	".", 0
+jr	host_resolved_noanswers_wasptr
+
+.host_resolved_noanswers_notptr
+
+ld	de, DNS_QNAME
+push	iy
+add	iy, de
+push	iy
+pop	hl
+pop	iy
+call	host_printname
+
+ld	d, (hl)
+inc	hl
+ld	e, (hl)
+
+.host_resolved_noanswers_wasptr
+
+ex	de, hl
+call	printstringimm
+defb	BS, " has no RRs of type ", 0
+call	printdec2
+call	printcrlf
+
+bit	DNS_AA_BIT, (iy + DNS_QFLAGS) ; Only check AA bit if no matches since
+ret	nz			; only applies to RR NAMEs which match QNAME
+
+call	printstringimm
+defb	"This response is not authoritative", 0
+
+ret
+
+.host_printname
+
+; Print DNS name
+;
+; On entry:
+;	HL -> (Q)NAME
+; On exit:
+;	HL -> first octet after (Q)NAME
+;	AF, BC corrupted
+
+push	de
+ld	de, 0
+
+.host_printname_nextlabel
+
+ld	a, (hl)
+inc	hl
+
+or	a			; Zero means root and so end
+jr	nz, host_printname_notend
+
+ld	a, d			; Did we follow a pointer?
+or	e
+jr	z, host_printname_hadnopointer
+
+ld	h, d			; If so, get the stashed end of (Q)NAME
+ld	l, e
+
+.host_printname_hadnopointer	; else it's already in HL
+
+pop	de
+ret
+
+.host_printname_notend
+
+bit	7, a			; Pointer has b7 (and b6) set
+jr	nz, host_printname_pointer
+ld	b, a
+push	de
+
+.host_printname_loop
+
+ld	a, (hl)
+inc	hl
+push	bc
+push	hl
+call	printcharsafe
+pop	hl
+pop	bc
+djnz	host_printname_loop
+
+pop	de
+call	printstringimm
+defb	".", 0
+
+jr	host_printname_nextlabel
+
+.host_printname_pointer
+
+and	&3f			; Mask out b7 and b6
+ld	b, a
+ld	c, (hl)			; Offset from DNS_ID1 now in BC
+
+ld	a, d
+or	e
+jr	nz, host_printname_hadpointer
+
+inc	hl
+ld	d, h			; Stash away the end of the (Q)NAME
+ld	e, l
+
+.host_printname_hadpointer
+
+ld	hl, DNS_ID1
+add	hl, bc			; Offset from UDP packet now in HL
+
+push	iy
+pop	bc
+add	hl, bc			; Pointed-to address now in HL
+
+jr	host_printname_nextlabel
+
+
+.host_keyhandler
+
+cp	CTRL_C			; It's that or nothing
+ret	nz
+
+call	resolv_abort
+
+jp	host_done
+
+
+.host_resolved_notrecursive
+
+defb	"The name server does not support recursive queries", CR, LF, 0
+
+.host_resolved_nameserver
+
+defb	BS, " has name server ", 0
+
+.host_resolved_canonicalname
+
+defb	BS, " has canonical name ", 0
+
+.host_resolved_pointer
+
+defb	BS, " is ", 0
+
+.host_resolved_exchange
+
+defb	", at ", 0
+
+.host_ancount
+
+defb	0
+
+.host_host
+
+defw	0
+
+.host_qtype
+
+defw	0
+
+.host_addr
+
+defs	4
+
+.host_reverselookup
+
+defb	"255.255.255.255.in-addr.arpa", 0	; Worst case
+
+.host_inaddrarpa
+
+defb	"in-addr.arpa", 0
+
+.host_inaddrarpaend

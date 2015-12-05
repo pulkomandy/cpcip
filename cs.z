@@ -1,0 +1,495 @@
+; CPC/IP checksum routines
+; Copyright (c) 1999-2000 Mark RISON
+
+
+; These routines all compute checksums as if the data to be
+; checksummed were little-endian.  This does not cause any
+; problems.  See RFC1071 if you need some convincing.
+
+; The checksum referred to is the standard Internet-flavour
+; checksum, that is, the one's complement sum (of the 16-bit
+; words).  Note that uneven (odd) blocks need to have a zero
+; written to the last (odd) octet; this is assumed to have
+; been done prior to calling any of these routines.
+
+; In general the routines return the checksum + 1, which should
+; be zero if a checksum including the checksum field has been
+; calculated.  If the checksum field itself is wanted, set it to
+; zero, call the routine, subtract 1 from DE, take the complement,
+; and write it into the checksum field (little-endianly).
+
+
+.cs_calcchecksum
+
+; Compute checksum
+;
+; On entry:
+;	IX -> block to checksum
+;	BC = number of halfwords to checksum
+;
+; On exit:
+;	DE = checksum + 1
+;	Z set if DE = 0 (i.e. checksum good)
+;	A, BC and other flags corrupt
+
+ld	de, 0
+
+.cs_calcpartialchecksum
+
+; Identical to cs_calcchecksum except DE is used as existing partial checksum
+
+push	hl
+ex	de, hl
+push	ix
+or	a
+push	af
+
+.cs_calcchecksum_loop
+
+pop	af				; 3N
+ld	e, (ix + 0)			; 5N
+ld	d, (ix + 1)			; 5N
+adc	hl, de				; 4N
+push	af				; 3N
+inc	ix				; 3N
+inc	ix				; 3N
+dec	bc				; 2N
+ld	a, b				; 1N
+or	c				; 1N
+jr	nz, cs_calcchecksum_loop	; 3/2N -> 33N per halfword
+
+pop	af
+ld	de, 1
+adc	hl, de
+ex	de, hl
+
+pop	ix
+pop	hl
+
+ret
+
+
+.cs_fastcalcchecksum
+
+; Compute checksum for fewer than 257 halfwords
+;
+; On entry:
+;	IX -> block to checksum
+;	B = number of halfwords to checksum (0 for 256)
+;
+; On exit:
+;	DE = checksum + 1
+;	Z set if DE = 0 (i.e. checksum good)
+;	A, BC and other flags corrupt
+
+ld	de, 0
+
+.cs_fastcalcpartialchecksum
+
+; Identical to cs_fastcalcchecksum except DE is used as existing partial checksum
+
+push	hl
+
+push	ix
+pop	hl
+or	a
+
+.cs_fastcalcchecksum_loop
+
+ld	a, e				; 1N
+adc	a, (hl)				; 2N
+inc	hl				; 2N
+ld	e, a				; 1N
+ld	a, d
+adc	a, (hl)
+inc	hl
+ld	d, a
+djnz	cs_fastcalcchecksum_loop	; 4/2N -> 16N per halfword
+
+ld	a, e
+adc	a, 1
+ld	e, a
+ld	a, d
+adc	a, 0
+ld	d, a
+
+pop	hl
+
+ret
+
+
+.cs_fastcalcaddrchecksum
+
+; Calculate IP address pseudoheader partial checksum,
+; given the other bits of the TCP/UDP pseudoheader
+;
+; On entry:
+;	IX -> IP datagram
+;	HL = protocol + length
+;
+; On exit:
+;	DE = pseudoheader checksum
+;	AF, HL corrupted
+;	Interrupts enabled
+;
+; Note that DE has not had the + 1 term added in,
+; unlike cs_calcchecksum and friends.
+;
+; Note this routine disables INTs for about 70 us.
+
+or	a					; 1N
+ld	d, l					; 1N
+ld	e, h					; (swapping intentional!)
+
+di						; 1N
+ld	(cs_fastcalcaddrchecksum_sp), sp	; 6N
+
+ld	sp, ix					; 3N
+ld	hl, 12					; 3N
+add	hl, sp					; 3N
+ld	sp, hl					; 2N
+
+ex	de, hl					; 1N
+pop	de					; 3N
+adc	hl, de					; 4N
+pop	de
+adc	hl, de
+pop	de
+adc	hl, de
+pop	de
+adc	hl, de
+ld	de, 0					; 3N
+adc	hl, de
+ex	de, hl
+
+ld	sp, (cs_fastcalcaddrchecksum_sp)	; 6N
+ei						; 1N
+
+ret						; 3N -> 68N overall
+
+.cs_fastcalcaddrchecksum_sp
+
+defs	2
+
+
+.cs_setlengthandchecksum
+
+; Set IP total length and set checksum
+;
+; On entry:
+;	IX -> IP datagram
+;	BC = payload size (must be <1024)
+;
+; On exit:
+;	BC = IP datagram total length
+
+push	af
+push	de
+push	hl
+
+ld	a, (ix + IP_VERIHL)
+and	&0f
+rlca
+rlca
+ld	l, a
+ld	h, 0
+add	hl, bc
+push	hl
+ld	(ix + IP_LEN1), h
+ld	(ix + IP_LEN0), l
+
+call	cs_setipchecksum
+
+pop	bc
+pop	hl
+pop	de
+pop	af
+
+ret
+
+
+.cs_setipchecksum
+
+; Set IP checksum
+;
+; On entry:
+;	IX -> IP datagram
+;
+; On exit:
+;	All regs preserved
+
+push	af
+push	de
+
+ld	(ix + IP_CSM1), 0
+ld	(ix + IP_CSM0), 0
+call	cs_calcipchecksum
+
+dec	de
+ld	a, e
+cpl
+ld	(ix + IP_CSM1), a
+ld	a, d
+cpl
+ld	(ix + IP_CSM0), a
+
+pop	de
+pop	af
+
+ret
+
+
+.cs_calcipchecksum
+
+; Compute IP checksum
+;
+; On entry:
+;	IX -> IP datagram
+;
+; On exit:
+;	DE = checksum + 1
+;	Z set if DE = 0 (i.e. checksum good)
+;	A and other flags corrupt
+
+push	bc
+
+ld	a, (ix + IP_VERIHL)
+and	&0f
+rla
+ld	b, a
+call	cs_fastcalcchecksum
+
+pop	bc
+
+ret
+
+
+if	TCP
+
+.cs_settcpchecksum
+
+; Set TCP checksum
+;
+; On entry:
+;	IX -> IP datagram
+;	IY -> TCP segment
+;	DE = TCP segment size
+;
+; On exit:
+;	All regs preserved
+
+push	af
+push	de
+
+ld	(iy + TCP_CSM1), 0
+ld	(iy + TCP_CSM0), 0
+call	cs_calctcpchecksum
+
+dec	de
+ld	a, e
+cpl
+ld	(iy + TCP_CSM1), a
+ld	a, d
+cpl
+ld	(iy + TCP_CSM0), a
+
+pop	de
+pop	af
+
+ret
+
+
+.cs_calctcpchecksum
+
+; Compute TCP checksum
+;
+; On entry:
+;	IX -> IP datagram
+;	IY -> TCP segment
+;	DE = TCP segment size
+;
+; On exit:
+;	DE = checksum + 1
+;	Z set if DE = 0 (i.e. checksum good)
+;	A and other flags corrupt
+
+push	bc
+push	hl
+push	ix
+
+				; Checksum that stupid TCP pseudoheader:
+ld	hl, IP_TCP		; Protocol element
+				; TCP length element already in DE
+push	de
+add	hl, de			; This can't carry because our MTU is 1023
+call	cs_fastcalcaddrchecksum	; Addresses element
+
+push	iy			; Now checksum in the TCP segment
+pop	ix
+pop	bc
+inc	bc			; Take care of uneven (odd) payloads
+srl	b
+rr	c
+call	cs_calcpartialchecksum
+
+pop	ix
+pop	hl
+pop	bc
+
+ret
+
+endif
+
+
+if	UDP
+
+.cs_setudpchecksum
+
+; Set UDP checksum
+;
+; On entry:
+;	IX -> IP datagram
+;	IY -> UDP datagram
+;
+; On exit:
+;	All regs preserved
+
+push	af
+push	de
+
+ld	(iy + UDP_CSM1), 0
+ld	(iy + UDP_CSM0), 0
+call	cs_calcudpchecksum
+
+ld	a, e
+or	d
+jr	z, cs_setudpchecksum_zero
+
+dec	de
+ld	a, e
+cpl
+ld	(iy + UDP_CSM1), a
+ld	a, d
+cpl
+ld	(iy + UDP_CSM0), a
+
+pop	de
+pop	af
+
+ret
+
+.cs_setudpchecksum_zero		; See RFC768
+
+dec	a			; &ff
+ld	(iy + UDP_CSM1), a
+ld	(iy + UDP_CSM0), a
+
+pop	de
+pop	af
+
+ret
+
+
+.cs_calcudpchecksum
+
+; Compute UDP checksum
+;
+; On entry:
+;	IX -> IP datagram
+;	IY -> UDP datagram
+;
+; On exit:
+;	DE = checksum + 1
+;	Z set if DE = 0 (i.e. checksum good)
+;	A and other flags corrupt
+
+push	bc
+push	hl
+push	ix
+
+				; Checksum that stupid UDP pseudoheader:
+ld	hl, IP_UDP		; Protocol element
+ld	d, (iy + UDP_LEN1)
+ld	e, (iy + UDP_LEN0)
+push	de
+add	hl, de			; This can't carry because our MTU is 1023
+call	cs_fastcalcaddrchecksum	; Addresses element
+
+push	iy			; Now checksum in the UDP datagram
+pop	ix
+pop	bc
+inc	bc			; Take care of uneven (odd) payloads
+srl	b
+rr	c
+call	cs_calcpartialchecksum
+
+pop	ix
+pop	hl
+pop	bc
+
+ret
+
+endif
+
+
+.cs_seticmpchecksum
+
+; Set ICMP checksum
+;
+; On entry:
+;	IY -> ICMP datagram
+;	DE = ICMP segment size
+;
+; On exit:
+;	All regs preserved
+
+push	af
+push	de
+
+ld	(iy + ICMP_CSM1), 0
+ld	(iy + ICMP_CSM0), 0
+call	cs_calcicmpchecksum
+
+dec	de
+ld	a, e
+cpl
+ld	(iy + ICMP_CSM1), a
+ld	a, d
+cpl
+ld	(iy + ICMP_CSM0), a
+
+pop	de
+pop	af
+
+ret
+
+
+.cs_calcicmpchecksum
+
+; Compute ICMP checksum
+;
+; On entry:
+;	IY -> ICMP datagram
+;	DE = ICMP segment size
+;
+; On exit:
+;	DE = checksum + 1
+;	Z set if DE = 0 (i.e. checksum good)
+;	A and other flags corrupt
+
+push	bc
+push	ix
+
+push	iy
+pop	ix
+ld	b, d
+ld	c, e
+inc	bc			; Take care of uneven (odd) payloads
+srl	b
+rr	c
+call	cs_calcchecksum
+
+pop	ix
+pop	bc
+
+ret

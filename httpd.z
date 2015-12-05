@@ -1,0 +1,498 @@
+; CPC/IP HTTP server
+; Copyright (c) 1999-2001 Mark RISON
+
+
+TCP_HTTP	equ	80
+HTTPD_BUFSIZ	equ	256
+
+
+HTTPD_PARSE	equ	0	; Must be 0
+HTTPD_FILL	equ	1
+HTTPD_DONE	equ	2
+
+
+.httpd_init
+
+call	printstringimm
+defb	"HTTP server initialised", CR, LF, 0
+
+ld	hl, httpd_sink_bind	; Sink must be started first
+call	tcp_sink
+
+.httpd_reinit
+
+xor	a
+ld	(httpd_lastNL), a
+ld	(httpd_parseC), a
+ld	(httpd_state), a
+ld	(httpd_fileopen), a
+ld	(httpd_request_index), a
+
+ld	hl, 0
+ld	(httpd_active_bind + 2), hl
+ld	(httpd_active_bind + 4), hl
+ld	(httpd_active_bind + 6), hl
+ld	(httpd_active_bind + 12 + TCP_OFFSETOF_SNDNUN), hl
+ld	(httpd_posfilename), hl
+
+ld	hl, httpd_active_bind
+jp	tcp_listen
+
+
+.httpd_active_bind
+
+defs	2			; Linked-link list
+defb	0, 0, 0, 0		; Any remote address
+defb	0, 0			; Any remote port
+defb	TCP_HTTP / 256, TCP_HTTP and &ff ; Local port
+defs	2			; TCP state handler
+defs	1			; TCP state
+defw	httpd_validate		; Connection request upcall
+defw	httpd_receive		; Receive upcall
+defw	httpd_sent		; Sent upcall
+defw	httpd_connclosed	; Connection closed upcall
+defs	4			; SNDUNA
+defs	4			; RCVNXT
+defw	256			; RCVWND
+defs	SIZEOF_TIMEOUT		; TCP retransmission timeout
+defw	0			; SNDNUN
+defs	HTTPD_BUFSIZ		; SNDBUF
+
+.httpd_sink_bind
+
+defs	2
+defb	0, 0, 0, 0		; Any remote address
+defb	0, 0			; Any remote port
+defb	TCP_HTTP / 256, TCP_HTTP and &ff ; Local port
+defs	2			; TCP state handler
+defs	1			; TCP state
+
+
+.httpd_validate
+
+; May corrupt AF, DE, HL
+; Set C if connection acceptable
+
+if	SHOW_INFO or 1
+
+call	printstringimm
+defb	"HTTP connection from ", 0
+push	ix
+pop	hl
+ld	de, IP_SRC3
+add	hl, de
+call	printipaddr
+call	printstringimm
+defb	":", 0
+ld	h, (iy + TCP_SRC1)
+ld	l, (iy + TCP_SRC0)
+call	printdec2
+call	printcrlf
+
+endif
+
+scf
+
+ret
+
+
+.httpd_receive_loop
+
+ld	hl, httpd_parseC
+ld	c, (hl)
+ld	a, (iy + 0)
+call	util_parsechar
+ld	(hl), c
+jr	c, httpd_receive_skipchar
+
+push	af
+
+ld	a, (httpd_lastNL)
+sub	1
+adc	a, 0			; Don't allow wrap-around
+ld	(httpd_lastNL), a
+
+ld	a, (httpd_request_index)
+cp	httpd_request_end - httpd_request
+jr	z, httpd_receive_requestfull
+inc	a
+ld	(httpd_request_index), a
+
+.httpd_receive_requestfull
+
+ld	c, a
+ld	b, 0
+ld	hl, httpd_request - 1	; - 1 because of INC A above
+add	hl, bc
+
+pop	af
+
+ld	(hl), a
+
+cp	NL
+call	z, httpd_handleNL
+
+.httpd_receive_skipchar
+
+inc	iy
+dec	de
+
+.httpd_receive
+
+ld	a, d
+or	e
+jr	nz, httpd_receive_loop
+
+.httpd_sent
+
+; If not special "fill" marker, return
+
+ld	a, (httpd_state)
+cp	HTTPD_FILL
+ret	nz
+
+.httpd_trymore
+
+ld	hl, (httpd_active_bind + 12 + TCP_OFFSETOF_SNDNUN)
+ld	bc, HTTPD_BUFSIZ
+or	a
+sbc	hl, bc
+jr	z, httpd_donefornow
+
+call	httpd_getoctet
+jr	nc, httpd_doneforever
+
+ld	hl, (httpd_active_bind + 12 + TCP_OFFSETOF_SNDNUN)
+inc	hl
+ld	(httpd_active_bind + 12 + TCP_OFFSETOF_SNDNUN), hl
+
+ld	bc, httpd_active_bind + 12 + TCP_OFFSETOF_SNDNUN + 1 ; + 1 in INC HL
+add	hl, bc
+ld	(hl), a
+
+jr	httpd_trymore
+
+.httpd_doneforever
+
+ld	a, HTTPD_DONE
+ld	(httpd_state), a
+ld	bc, httpd_active_bind + UCP_OFFSETOF_EXTRA	; FIXME really should have preserved bc!
+jp	tcp_close
+
+.httpd_donefornow
+
+ret
+
+
+.httpd_getoctet
+
+ld	hl, (httpd_response_index)
+ld	a, h
+or	l
+jr	nz, httpd_getoctet_again
+
+ld	hl, (httpd_file_handle)
+call	FILE_IN_CHAR
+push	af
+call	nc, FILE_IN_CLOSE	; FIXME Should really check for EOF
+pop	af
+ret
+
+.httpd_getoctet_again
+
+ld	a, (hl)
+or	a
+inc	hl
+ld	(httpd_response_index), hl
+scf
+ret	nz
+
+ld	bc, httpd_response_common_end
+or	a
+sbc	hl, bc
+ret	z			; C clear too
+
+ld	hl, httpd_response_common
+jr	httpd_getoctet_again
+
+
+.httpd_handleNL
+
+; Terminate the string in the normal way
+
+ld	(hl), 0
+
+; Nothing needs doing if we're doing a "fill" or a "fin"
+
+ld	a, (httpd_state)
+or	a
+ret	nz
+
+; Have we already parsed the request?
+
+ld	hl, (httpd_posfilename)
+ld	a, h
+or	l
+jr	z, httpd_handleNL_parse
+
+; Was the last NL fewer than 2 chars away?
+
+ld	a, (httpd_lastNL)
+or	a
+
+; No, so restart the search for a blank line
+
+ld	a, 2
+ld	(httpd_lastNL), a
+ret	z
+
+; Yes, so that's the end of the request; switch into "fill" mode
+
+.httpd_handleNL_initfill
+
+ld	a, HTTPD_FILL
+ld	(httpd_state), a
+
+if	SHOW_INFO
+
+call	printstringimm
+defb	'/', 0
+ld	a, (httpd_lenfilename)
+call	printdeccrlf
+
+endif
+
+; Expand null filename to default filename
+
+ld	a, (httpd_lenfilename)
+or	a
+jr	nz, httpd_handleNL_initfill_notdefault
+
+ld	a, httpd_defaultfilenameend - httpd_defaultfilename
+ld	(httpd_lenfilename), a
+ld	hl, httpd_defaultfilename
+ld	(httpd_posfilename), hl
+
+.httpd_handleNL_initfill_notdefault
+
+; Complain about bad requests
+
+inc	a
+jr	nz, httpd_handleNL_initfill_notbad
+
+.hackfornow
+
+ld	hl, httpd_response_badrequest
+ld	(httpd_response_index), hl
+
+ret
+
+.httpd_handleNL_initfill_notbad
+
+; Whee!
+
+ld	b, a
+dec	b			; Compensate for INC A above
+ld	hl, (httpd_posfilename)
+call	FILE_IN_OPEN
+jr	nc, httpd_handleNL_initfill_notfound
+
+ld	a, 1
+ld	(httpd_fileopen), a
+ld	(httpd_file_handle), hl
+ld	hl, 0
+ld	(httpd_response_index), hl
+
+ret
+
+.httpd_handleNL_initfill_notfound
+
+; FIXME really should distinguish between not found and other errors
+
+ld	hl, httpd_response_filenotfound
+ld	(httpd_response_index), hl
+
+ret
+
+.httpd_handleNL_parse
+
+; Parse request
+
+ld	hl, httpd_request
+call	util_skipspace
+ld	a, (hl)
+cp	'G'
+jr	nz, httpd_badrequest
+inc	hl
+ld	a, (hl)
+cp	'E'
+jr	nz, httpd_badrequest
+inc	hl
+ld	a, (hl)
+cp	'T'
+jr	nz, httpd_badrequest
+inc	hl
+call	util_skipspace
+ld	a, (hl)
+cp	'/'
+jr	nz, httpd_badrequest
+inc	hl
+ld	(httpd_posfilename), hl
+ld	b, 255
+
+.httpd_handleNL_findver
+
+inc	b
+ld	a, (hl)
+or	a
+
+if	SHOW_INFO
+push	af
+push	bc
+push	de
+push	hl
+call	nz, printcharverysafe
+pop	hl
+pop	de
+pop	bc
+pop	af
+endif
+
+jr	z, httpd_handleNL_http09
+inc	hl
+cp	' '
+jr	nz, httpd_handleNL_findver
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	nz, httpd_handleNL_http10
+
+.httpd_handleNL_http09
+
+ld	a, b
+
+.httpd_badrequest_cleanup
+
+ld	(httpd_lenfilename), a
+
+; It's an HTTP/0.9 request, so that's it; switch into "fill" mode
+
+call	httpd_handleNL_initfill
+
+ret
+
+.httpd_badrequest	; FIXME
+
+ld	a, 255
+jr	httpd_badrequest_cleanup
+
+.httpd_handleNL_http10
+
+ld	a, b
+ld	(httpd_lenfilename), a
+
+; It's an >HTTP/0.9 request, so wait for blank line
+
+ld	a, 2
+ld	(httpd_lastNL), a
+
+ret
+
+
+.httpd_lastNL
+
+defs	1
+
+.httpd_parseC
+
+defs	1
+
+.httpd_state
+
+defs	1
+
+.httpd_fileopen
+
+defs	1
+
+.httpd_file_handle
+
+defs	2
+
+.httpd_response_index
+
+defs	2
+
+.httpd_posfilename
+
+defs	2
+
+.httpd_lenfilename
+
+defs	1
+
+.httpd_defaultfilename
+
+defb	"index.htm"
+
+.httpd_defaultfilenameend
+
+.httpd_response_badrequest
+
+defb	"<HTML>"
+defb	"Bad request", 0
+
+.httpd_response_filenotfound
+
+defb	"<HTML>"
+defb	"File not found", 0
+
+.httpd_response_common
+
+defb	"<HR>"
+defb	"Powered by tipi", CR, LF
+defb	"<BR>"
+defb	'<A HREF="http://www.nenie.org/cpcip/">', CR, LF
+defb	"CPC/IP, the oh in .com</A>"
+defb	"</HTML>", CR, LF, 0
+
+.httpd_response_common_end
+
+.httpd_request
+
+defs	128
+
+.httpd_request_end
+
+.httpd_request_index
+
+defs	1
+
+
+.httpd_connclosed
+
+ld	a, d
+cp	TCP_CLOSE_REMOTE
+jp	z, tcp_close
+
+ld	a, (httpd_fileopen)
+or	a
+call	nz, FILE_IN_CLOSE
+
+call	printcrlfmaybe
+call	printstringimm
+defb	"HTTP connection closed", CR, LF, 0
+
+jp	httpd_reinit
+
+
+.httpd_final
+
+ld	a, (httpd_fileopen)
+or	a
+call	nz, FILE_IN_CLOSE
+
+ld	hl, httpd_sink_bind
+call	tcp_abort
+ld	hl, httpd_active_bind
+jp	tcp_abort

@@ -1,0 +1,253 @@
+; CPC/IP timeout abstraction layer
+; Copyright (c) 1999-2001 Mark RISON
+
+; A timeout abstraction layer must export the following routines
+; (the entry/exit conditions are described here at the top of each):
+; timeout_init, timeout_create, timeout_set, timeout_stop, timeout_destroy,
+; timeout_dispatch, timeout_final
+;
+; A timeout abstraction layer must export the following symbols:
+; SIZEOF_TIMEOUT, TICKS_PER_SEC
+
+
+SIZEOF_TIMEOUT	equ	15
+TICKS_PER_SEC	equ	50	; For converting seconds to timeout_set units
+
+
+.timeout_init
+
+; Initialise timeout abstraction layer
+;
+; On exit:
+;	AF, BC, DE, HL may be corrupted
+;
+; Interrupts may be enabled.
+;
+; Amstrad CPC-specific implementation note:
+;
+; There is a bug in BASIC.
+; Break events are not disabled when a RSX is involved.
+; So if for example we're in Maxam and press ESC,
+; an inapplicable synchronous event is queued
+; (it doesn't even have an appropriate ROM select byte!).
+; Solve the problem by disarming break events.
+
+KM_DISARM_BREAK equ	&bb48
+
+jp	KM_DISARM_BREAK
+
+
+.timeout_create
+
+; Create a timeout object
+;
+; On entry:
+;	HL -> timeout struct (size SIZEOF_TIMEOUT)
+;	DE = timeout handler
+;
+; On exit:
+;	AF, BC, DE, HL corrupt
+;
+; The timeout object isn't activated until timeout_set is
+; called, specifying the timeout period.
+;
+; Interrupts may be enabled.
+;
+; The handler conditions are:
+;
+; On entry:
+;	DE -> timeout struct (size SIZEOF_TIMEOUT)
+;
+; On exit:
+;	AF, BC, DE, HL, IX, IY corrupt
+;
+; Interrupts may be enabled.
+
+KL_INIT_EVENT	equ	&bcef
+
+push	de
+ld	de, timeout_veneer
+ld	bc, 6		; The event block starts at offset 6 in a tick block
+add	hl, bc
+ld	bc, &02ff	; Priority 1 normal synchronous event with ROMs off
+call	KL_INIT_EVENT	; Event routine in DE; returns HL -> user fields
+pop	de
+ld	(hl), e
+inc	hl
+ld	(hl), d
+ret
+
+.timeout_veneer
+
+; Amstrad CPC-specific implementation note:
+;
+; It is necessary to veneer the timeout handler in order to
+; obey the constraints on event routines, and to pass in the
+; pointer to the timeout struct.
+;
+; Soft 968 (page 15.200) states that IX and IY may not be corrupted, and
+; for a far address event routine HL points at offset 5 of the event block
+; (i.e. 2 from the user fields).
+;
+; I think Soft 968 is lying; it appears that HL points at offset 4
+; (i.e. 3 away)!
+
+push	ix
+push	iy
+
+inc	hl
+inc	hl
+inc	hl
+ld	e, (hl)
+inc	hl
+ld	d, (hl)
+
+ld	bc, -8 - 6	; The event block starts at offset 6 in a tick block
+add	hl, bc
+ex	de, hl
+call	callhl
+
+pop	iy
+pop	ix
+ret
+
+
+.timeout_set
+
+; Set (or reset) a timeout object
+;
+; On entry:
+;	HL -> timeout struct (size SIZEOF_TIMEOUT)
+;	DE = timeout period in ticks (must be >= 2)
+;
+; On exit:
+;	DE, HL corrupt
+;
+; Note make sure race conditions can't occur by removing the
+; timeout if it's already queued (i.e. gone off but not dispatched).
+;
+; Interrupts may be enabled.
+
+KL_DEL_SYNCHRONOUS equ	&bcf8
+KL_ADD_TICKER	equ	&bce9
+
+push	af
+push	bc
+
+push	de
+push	hl
+ld	bc, 6		; The event block starts at offset 6 in a tick block
+add	hl, bc
+call	KL_DEL_SYNCHRONOUS	; Sets event count to -64, disarming event
+pop	hl
+pop	de
+
+push	hl
+ld	bc, 0		; Recharge value
+call	KL_ADD_TICKER	; Interrupt could go off right after this;
+pop	hl		; this is why insist on period being greater than one
+
+ld	bc, 6 + 2	; The event count is at offset 2 in an event block
+add	hl, bc
+ld	(hl), 0		; Set event count back to 0, reenabling event
+
+pop	bc
+pop	af
+
+ret
+
+
+.timeout_stop
+
+; Stop a timeout object
+;
+; On entry:
+;	HL -> timeout struct (size SIZEOF_TIMEOUT)
+;
+; On exit:
+;	DE, HL corrupt
+;
+; Note make sure race conditions can't occur by removing the
+; timeout if it's already queued (i.e. gone off but not dispatched).
+;
+; Interrupts may be enabled.
+
+push	af
+push	bc
+
+call	timeout_destroy
+
+pop	bc
+pop	af
+
+ret
+
+
+.timeout_destroy
+
+; Destroy a timeout object
+;
+; On entry:
+;	HL -> timeout struct (size SIZEOF_TIMEOUT)
+;
+; On exit:
+;	AF, BC, DE, HL corrupt
+;
+; The timeout object is removed from the timeout queue if it is on it.
+; Note this means it is valid to call this routine "just in case".
+;
+; Interrupts may be enabled.
+
+KL_DEL_TICKER	equ	&bcec
+
+push	hl
+ld	bc, 6		; The event block starts at offset 6 in a tick block
+add	hl, bc
+call	KL_DEL_SYNCHRONOUS
+pop	hl
+
+jp	KL_DEL_TICKER
+
+
+.timeout_dispatch
+
+; Dispatch any expired timeouts by calling their handlers
+;
+; On exit:
+;	AF, BC, DE, HL, IX, IY corrupt
+;
+; Interrupts may be enabled.
+
+KL_POLL_SYNCHRONOUS equ &b921
+KL_NEXT_SYNC	equ	&bcfb
+KL_DO_SYNC	equ	&bcfe
+KL_DONE_SYNC	equ	&bd01
+
+call	KL_POLL_SYNCHRONOUS
+ret	nc
+
+.timeout_nextevent
+
+call	KL_NEXT_SYNC
+ret	nc
+
+push	af
+push	hl
+call	KL_DO_SYNC
+pop	hl
+pop	af
+
+call	KL_DONE_SYNC
+jr	timeout_nextevent
+
+
+.timeout_final
+
+; Finalise timeout abstraction layer
+;
+; On exit:
+;	AF, BC, DE, HL may be corrupted
+;
+; Interrupts may be enabled.
+
+ret

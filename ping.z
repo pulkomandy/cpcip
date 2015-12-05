@@ -1,0 +1,526 @@
+; CPC/IP ping client
+; Copyright (c) 1999-2001 Mark RISON
+
+
+.ping_syntax
+
+call	printstringimm
+defb	"ping [-s packetsize] [-c count] [-q] [-f | -i wait] host", CR, LF, 0
+jp	keyb_client_done
+
+
+PING_TOS		equ	&00	; 0000 (default) -- RFC1700 recommended
+
+PING_DEFAULT_INTERVAL	equ	TICKS_PER_SEC
+PING_FLOOD_INTERVAL	equ	TICKS_PER_SEC / 10
+PING_DEFAULT_SIZE	equ	56	; Excluding IP and ICMP headers
+PING_SIZEOF_TIMESTAMP	equ	4
+
+
+.ping_init
+
+call	printstringimm
+defb	"ping client initialised", CR, LF, 0
+ret
+
+
+.ping_do
+
+; Check for absence of arguments
+
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	z, ping_syntax
+
+; Initialise options
+
+xor	a
+ld	(ping_qflag), a
+ld	(ping_maxack), a
+
+ld	bc, 0
+ld	(ping_host), bc
+
+ld	a, PING_DEFAULT_SIZE
+ld	(ping_size), a
+
+ld	bc, PING_DEFAULT_INTERVAL
+ld	(ping_interval), bc
+
+.ping_parse
+
+; Parse command line
+
+call	util_skipspace
+ld	a, (hl)
+or	a
+jr	z, ping_parsed
+
+cp	SWITCH
+jr	z, ping_switch
+
+; No switch?  It must be the host address
+
+ld	(ping_host), hl
+call	util_skiptospace
+
+jr	ping_parse
+
+.ping_switch
+
+; Parse all the switches
+
+inc	hl
+ld	a, (hl)
+inc	hl
+
+; -q (quiet)
+
+cp	'q'
+jr	nz, ping_notq
+ld	a, 1
+ld	(ping_qflag), a
+jr	ping_parse
+
+.ping_notq
+
+; -f (flood ping)
+
+cp	'f'
+jr	nz, ping_notf
+ld	de, PING_FLOOD_INTERVAL
+ld	(ping_interval), de
+jr	ping_parse
+
+.ping_notf
+
+; -c n (limit count)
+
+cp	'c'
+jr	nz, ping_notc
+call	util_skipspace
+call	util_readdec
+ld	(ping_maxack), a
+jr	ping_parse
+
+.ping_notc
+
+; -i n (ping interval)
+
+cp	'i'
+jr	nz, ping_noti
+call	util_skipspace
+call	util_readdec
+or	a
+jr	z, ping_noti		; Interval must be at least 1
+push	hl
+ld	h, 0
+ld	l, a
+call	util_mul50
+ld	(ping_interval), hl
+pop	hl
+jr	ping_parse
+
+.ping_noti
+
+; -s n (payload size)
+
+cp	's'
+jr	nz, ping_nots
+call	util_skipspace
+call	util_readdec
+cp	PING_SIZEOF_TIMESTAMP	; Need space for timestamp
+jr	c, ping_nots
+ld	(ping_size), a
+jr	ping_parse
+
+.ping_nots
+
+; Well, what more do you want?
+
+jp	ping_syntax
+
+
+.ping_parsed
+
+; Make sure a host address was specified
+
+ld	hl, (ping_host)
+ld	a, h
+or	l
+jp	z, ping_syntax
+
+; Register key handler (for CTRL-C to abort resolving)
+
+ex	de, hl
+ld	hl, ping_keyhandler_resolv
+call	keyb_client_doing
+ex	de, hl
+
+; Look up the address using the resolver
+
+call	printstringimm
+defb	"[Abort character is '^C']", CR, LF, 0
+
+ld	de, ping_resolved
+jp	resolv_gethostbyname
+
+
+.ping_resolved
+
+; Check what the status code says
+
+or	a			; DNS_NOERR
+jp	nz, resolv_whine
+
+; Resolved OK!
+
+ld	de, ping_addr
+ld	bc, 4
+ldir
+
+; Register key handler (for CTRL-C to abort pinging)
+
+ld	hl, ping_keyhandler
+call	keyb_client_doing
+
+; Confirm details
+
+call	printstringimm
+defb	"[", 0
+ld	hl, ping_addr
+call	printipaddr
+call	printstringimm
+defb	", ", 0
+ld	a, (ping_size)
+call	printdec
+call	printstringimm
+defb	" data bytes]", CR, LF, 0
+
+; Create timeout for next ping
+
+ld	hl, ping_interval_timeout
+ld	de, ping_interval_tick
+call	timeout_create
+
+; Register as ICMP ECHO REPLY client
+
+ld	hl, ping_icmphandler
+ld	(icmp_client_echoreply), hl
+
+; Initialise the counters
+
+ld	hl, 0
+ld	(ping_maxrtt), hl
+ld	(ping_acknum), hl
+ld	(ping_seqnum), hl
+dec	hl
+ld	(ping_minrtt), hl
+
+.ping_interval_tick
+
+; Progress message
+
+ld	a, (ping_qflag)
+or	a
+jr	nz, ping_progress_quiet
+
+call	printcrlfmaybe
+call	printstringimm
+defb	"ping...", 0
+
+.ping_progress_quiet
+
+; Assemble ICMP ECHO message
+
+ld	ix, iptxbuffer
+
+; Set up IP header
+
+ld	(ix + IP_VERIHL), &45
+ld	(ix + IP_TOS), PING_TOS
+call	ip_getID
+ld	(iptxbuffer + IP_ID1), hl
+ld	(ix + IP_FRG1), IP_DF
+ld	(ix + IP_FRG0), 0
+ld	(ix + IP_TTL), IP_DEFAULT_TTL
+ld	(ix + IP_PRT), IP_ICMP
+
+ld	hl, config_hostaddr
+ld	de, iptxbuffer + IP_SRC3
+ld	bc, 4
+ldir				; DE = iptxbuffer + IP_DST3
+ld	hl, ping_addr
+ld	c, 4
+ldir
+
+; Set up ICMP header
+
+ld	(ix + IP_HDRSIZE + ICMP_TYPE), ICMP_ECHO
+ld	(ix + IP_HDRSIZE + ICMP_CODE), 0
+ld	(ix + IP_HDRSIZE + ICMP_ID1), 0
+ld	(ix + IP_HDRSIZE + ICMP_ID0), 0
+ld	hl, (ping_seqnum)
+inc	hl
+ld	(ping_seqnum), hl
+ld	(ix + IP_HDRSIZE + ICMP_SEQ1), h
+ld	(ix + IP_HDRSIZE + ICMP_SEQ0), l
+
+; Schedule next ping
+
+ld	a, (ping_maxack)	; maxack zero if uncounted pinging
+or	a
+jr	z, ping_notatmaxack
+cp	l
+jr	z, ping_atmaxack	; seqnum == maxack if done sending pings
+
+.ping_notatmaxack
+
+ld	hl, ping_interval_timeout
+ld	de, (ping_interval)
+call	timeout_set
+
+.ping_atmaxack
+
+; Set up ICMP ECHO payload
+
+call	KL_TIME_PLEASE
+ld	(ix + IP_HDRSIZE + ICMP_HDRSIZE + 0), d
+ld	(ix + IP_HDRSIZE + ICMP_HDRSIZE + 1), e
+ld	(ix + IP_HDRSIZE + ICMP_HDRSIZE + 2), h
+ld	(ix + IP_HDRSIZE + ICMP_HDRSIZE + 3), l
+
+; Initialise the rest of the payload, if any
+
+ld	a, (ping_size)
+sub	PING_SIZEOF_TIMESTAMP
+jr	z, ping_lean
+
+ld	b, a
+
+.ping_fill			; Fill with octets decrementing to 1
+
+ld	(ix + IP_HDRSIZE + ICMP_HDRSIZE + 4), b
+inc	ix
+djnz	ping_fill
+
+ld	(ix + IP_HDRSIZE + ICMP_HDRSIZE + 4), 0	; Pad out potential odd octet
+
+.ping_lean
+
+; Plonk in the length and checksums and fire packet off
+
+ld	iy, iptxbuffer + IP_HDRSIZE
+ld	de, ICMP_HDRSIZE
+ld	a, (ping_size)
+ld	l, a
+ld	h, 0
+add	hl, de
+ex	de, hl
+push	de
+call	cs_seticmpchecksum
+ld	ix, iptxbuffer
+pop	bc
+call	cs_setlengthandchecksum
+call	slip_sendpacket
+
+or	a			; Remember the resolver?
+ret				; Make sure it's thanked but turned away
+
+
+.ping_host
+
+defs	2
+
+.ping_addr
+
+defs	4
+
+.ping_seqnum
+
+defs	2
+
+.ping_acknum
+
+defs	2
+
+.ping_minrtt
+
+defs	2
+
+.ping_maxrtt
+
+defs	2
+
+.ping_interval
+
+defs	2
+
+.ping_interval_timeout
+
+defs	SIZEOF_TIMEOUT
+
+.ping_qflag
+
+defs	1
+
+.ping_maxack
+
+defs	1
+
+.ping_size
+
+defs	1
+
+
+.ping_keyhandler
+
+cp	CTRL_C			; It's that or nothing
+ret	nz
+
+.ping_terminate
+
+; Display pinging summary
+
+call	printcrlfmaybe
+ld	hl, (ping_seqnum)
+call	printdec2
+call	printstringimm
+defb	" packets transmitted, ", 0
+ld	hl, (ping_acknum)
+call	printdec2
+call	printstringimm
+defb	" packets received", CR, LF, 0
+
+ld	a, h
+or	l
+jp	z, ping_done
+
+call	printstringimm
+defb	"minimum round-trip time ", 0
+ld	hl, (ping_minrtt)
+call	printdec2
+call	printstringimm
+defb	" cs, maximum round-trip time ", 0
+ld	hl, (ping_maxrtt)
+call	printdec2
+call	printstringimm
+defb	" cs", CR, LF, 0
+
+jp	ping_done
+
+
+.ping_keyhandler_resolv
+
+cp	CTRL_C			; It's that or nothing
+ret	nz
+
+call	resolv_abort
+
+jp	ping_done
+
+
+.ping_icmphandler
+
+; An ICMP ECHO REPLY has arrived!
+
+ld	a, (iy + ICMP_TYPE)
+cp	ICMP_ECHO_REPLY
+ret	nz
+
+; FIXME do some checking! (packet size, ICMP code, ICMP ECHO REPLY identifier)
+
+; Compute round-trip time
+
+call	KL_TIME_PLEASE
+ld	b, (iy + ICMP_HDRSIZE + 2)
+ld	c, (iy + ICMP_HDRSIZE + 3)
+or	a
+sbc	hl, bc			; FIXME what if > 65536/300 s?
+call	util_div3		; FIXME this fails for >~ 49000
+
+ld	a, (ping_qflag)
+or	a
+jr	nz, ping_icmphandler_quiet
+
+call	printstringimm
+defb	CR, "ping #", 0
+push	hl
+ld	h, (iy + ICMP_SEQ1)
+ld	l, (iy + ICMP_SEQ0)
+call	printdec2
+pop	hl
+call	printstringimm
+defb	" round-trip time ", 0
+call	printdec2
+
+.ping_icmphandler_quiet
+
+; Update min/max RTT
+
+ex	de, hl
+ld	hl, (ping_minrtt)
+or	a
+sbc	hl, de
+jr	c, ping_notminrtt
+ld	(ping_minrtt), de
+
+.ping_notminrtt
+
+ld	hl, (ping_maxrtt)
+or	a
+sbc	hl, de
+jr	nc, ping_notmaxrtt
+ld	(ping_maxrtt), de
+
+.ping_notmaxrtt
+
+; Bump the ack counter
+
+ld	hl, (ping_acknum)
+inc	hl
+ld	(ping_acknum), hl
+
+; Display TTL
+
+ld	a, (ping_qflag)
+or	a
+jr	nz, ping_icmphandler_quiet2
+
+call	printstringimm
+defb	" cs, TTL ", 0
+ld	a, (ix + IP_TTL)
+call	printdec
+call	printcrlf
+
+.ping_icmphandler_quiet2
+
+; Are we done?
+
+ld	a, (ping_maxack)
+or	a
+ret	z
+
+cp	l
+jp	z, ping_terminate
+
+ret
+
+
+.ping_done
+.ping_final
+
+; Stop any scheduled ping
+
+ld	hl, ping_interval_timeout
+call	timeout_destroy
+
+; Unclaim ICMP ECHO REPLY
+
+ld	hl, 0
+ld	(icmp_client_echoreply), hl
+
+; Give keyboard back to command line input
+
+jp	keyb_client_done

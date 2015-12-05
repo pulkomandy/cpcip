@@ -1,0 +1,2023 @@
+; CPC/IP TCP layer
+; Copyright (c) 1999-2001 Mark RISON
+
+
+; See RFC793 and RFC1122
+
+
+; The TCP layer exports the following routines
+; (the entry/exit conditions are described here at the top of each):
+; tcp_connect, tcp_listen, tcp_sink,
+; tcp_maysend, tcp_send,
+; tcp_close, tcp_abort
+;
+; The TCP layer exports the following symbols:
+; TCP_CLOSE_NORMAL, TCP_CLOSE_REFUSED, TCP_CLOSE_RESET, TCP_CLOSE_REMOTE,
+; TCP_OFFSETOF_SNDNUN, TCP_OFFSETOF_SNDBUF, TCP_OFFSETOF_RCVWND
+; TCP_SRC1, TCP_SRC0
+
+; A server will typically do:
+; - tcp_sink (to quietly dump packets received when active)
+; - tcp_listen
+; - tcp_close
+;
+; A client will typically do:
+; - tcp_connect
+; - tcp_send (or, perhaps, tcp_send_now)
+; - tcp_close
+;
+; Data to be transmitted needs to be plonked into the SNDBUF
+; and the number of octets in there in SNDNUN.  This is up to the
+; application; the application must not cache either in any way.
+; The application must then call tcp_send, unless it's in an upcall.
+; SNDNUN must not exceed 536 octets.
+;
+; Data received is passed to the application, which must accept
+; it (no buffering is performed by the TCP layer) and update
+; RCVWIN to specify how many more octets it's prepared to accept
+; (it may assume the value hasn't been changed by the TCP layer).
+; It is bad manners to reduce RCVWIN by more than the number of
+; octets received.  Note that this model means that the application
+; has to do SWS avoidance.
+; FIXME need to handle case where this is zero
+;
+; The application may only call tcp_close during certain upcalls;
+; it must then wait for the close upcall.
+; The application may not call tcp_abort during an upcall.
+;
+; The upcalls are:
+; - connection request
+;	in: packet (IX -> IP datagram, IY -> TCP segment)
+;	out: C set iff accept (if rejected then will auto-return to listen)
+;	note: this upcall only exists for servers (i.e. tcp_listen callers)
+; - received data
+;	in: buffer (IY -> data, DE = length (may be zero))
+;	out: nothing
+;	note: may call tcp_close
+; - sent data
+;	in: reason (D = reason code)
+;	out: nothing
+;	note: RCVWND must not be updated
+;	note: may call tcp_close iff D != TCP_SENT_INIT
+; - close notification
+;	in: reason (D = reason code)
+;	out: nothing
+;	note: may call tcp_close iff TCP_CLOSE_REMOTE
+;
+; Upcall may rely on BC, IX, IY
+; Upcall may corrupt AF, BC, DE, HL, IX, IY
+; Upcall may modify RCVWND, SNDBUF, SNDNUN unless otherwise specified
+; Upcall may call tcp_close (if not connection request), but not tcp_abort
+;
+; Note that once tcp_close has been called SNDNUN should not be
+; touched by the app until the TCP_CLOSE_NORMAL upcall occurs
+; (tcp_maysend can be used by the application for this purpose).
+; Remember that TCP has independent closing for each direction,
+; so it is not necessary, albeit typical, to call tcp_close
+; as soon as TCP_CLOSE_REMOTE is notified.
+;
+; It's probably OK to prequeue data for transmission (i.e. SNDNUN != 0)
+; before calling tcp_connect or tcp_open, but this hasn't been tested!
+
+; FIXME I don't quite understand the ACK processing for SYNRECEIVED:
+; why is SNDUNA == SEGACK acceptable and
+; why not return to LISTEN if not acceptable?
+
+; Known limitations
+; #1: Segments only partially containing new data are not handled properly;
+; an ack is merely sent to coax the sender into sending data at RCVNXT.
+; #2: Segments with premature data are not held for future processing
+; (this is not an actual violation of the spec).
+; #3: Simultaneous connections are not allowed (can't go from
+; SYNSENT to SYNRECEIVED).
+; #4: Bad ACKs in SYNRECEIVED do not cause a connection reset.
+; #5: There's no MSL timeout; go straight from TIMEWAIT to CLOSED.
+; #6: It's not possible to make a passive open go active (can't go from
+; LISTEN to SYNSENT).
+; #7: There is no support for URG functionality.
+; #8: If the peer sends too much data (c.f. RCVWND) it is accepted.
+; #9: No account is taken of the peer's RCVWND.
+; #10: The retransmission timeout is fixed.
+
+TCP_SRC1		equ	0
+TCP_SRC0		equ	1
+
+TCP_DST1		equ	2
+TCP_DST0		equ	3
+
+TCP_SEQ3		equ	4
+TCP_SEQ2		equ	5
+TCP_SEQ1		equ	6
+TCP_SEQ0		equ	7
+
+TCP_ACK3		equ	8
+TCP_ACK2		equ	9
+TCP_ACK1		equ	10
+TCP_ACK0		equ	11
+
+TCP_HSZ			equ	12
+
+TCP_FLG			equ	13
+TCP_DAT_BIT		equ	7	; Internal signalling only
+TCP_URG_BIT		equ	5
+TCP_ACK_BIT		equ	4
+TCP_PSH_BIT		equ	3
+TCP_RST_BIT		equ	2
+TCP_SYN_BIT		equ	1
+TCP_FIN_BIT		equ	0
+TCP_DAT			equ	&80
+TCP_URG			equ	&20
+TCP_ACK			equ	&10
+TCP_PSH			equ	&08
+TCP_RST			equ	&04
+TCP_SYN			equ	&02
+TCP_FIN			equ	&01
+
+TCP_WIN1		equ	14
+TCP_WIN0		equ	15
+
+TCP_CSM1		equ	16
+TCP_CSM0		equ	17
+
+TCP_URG1		equ	18
+TCP_URG0		equ	19
+
+TCP_HDRSIZE		equ	20
+TCP_HSZ_MIN		equ	&50
+
+
+TCP_RTO			equ	3 * TICKS_PER_SEC
+
+
+; The TCB structure -- all little-endian
+; FIXME some bits of code still rely on ordering (esp. SNDBUF == SNDNUN + 2)
+
+TCP_OFFSETOF_STATE	equ	0	; Must be at 0
+TCP_OFFSETOF_CONNUP	equ	1
+TCP_OFFSETOF_RECVUP	equ	3
+TCP_OFFSETOF_SENTUP	equ	5
+TCP_OFFSETOF_CLOSUP	equ	7
+TCP_OFFSETOF_SNDUNA	equ	9
+TCP_OFFSETOF_RCVNXT	equ	13
+TCP_OFFSETOF_RCVWND	equ	17
+TCP_OFFSETOF_RETXTO	equ	19
+TCP_OFFSETOF_SNDNUN	equ	19 + SIZEOF_TIMEOUT	; Note SNDNXT = SNDUNA + SNDNUN
+TCP_OFFSETOF_SNDBUF	equ	21 + SIZEOF_TIMEOUT
+
+
+; Don't renumber these as some bits of code rely on the ordering
+
+TCP_CLOSED_STATE	equ	0
+TCP_LISTEN_STATE	equ	1
+TCP_SYNSENT_STATE	equ	2
+TCP_SYNRECEIVED_STATE	equ	3
+TCP_ESTABLISHED_STATE	equ	4
+TCP_FINWAIT1_STATE	equ	5
+TCP_FINWAIT2_STATE	equ	6
+TCP_CLOSEWAIT_STATE	equ	7
+TCP_CLOSING_STATE	equ	8
+TCP_LASTACK_STATE	equ	9
+TCP_TIMEWAIT_STATE	equ	10
+TCP_SINK_STATE		equ	11	; Just throw away packet
+
+
+; Reason codes for CLOSUP:
+
+; Connection terminated bidirectionally
+; - tcp_remove has already been called
+; - tcp_connect may be called again from upcall
+TCP_CLOSE_NORMAL	equ	0
+; tcp_connect refused
+; - tcp_remove has already been called
+; - tcp_connect may be called again from upcall
+TCP_CLOSE_REFUSED	equ	1
+; Remote has signalled a reset
+; - tcp_remove has already been called
+; - tcp_connect may be called again from upcall
+TCP_CLOSE_RESET		equ	2
+; Remote has signalled a close
+; - tcp_close may be called from upcall;
+;   this will eventually be acknowledged by a TCP_CLOSE_NORMAL
+TCP_CLOSE_REMOTE	equ	3
+
+
+; Reason codes for SENTUP:
+
+; We've heard something (after a tcp_listen)
+TCP_SENT_INIT		equ	0
+; We've managed to send something (from SNDBUF)
+TCP_SENT_NORMAL		equ	1
+
+
+.tcp_
+
+; The minimal TCP segment size is 20
+
+push	hl
+ld	hl, -TCP_HDRSIZE
+add	hl, de
+pop	hl
+jp	nc, tcp_toosmall
+
+; Does the declared segment header size fit in the received segment size?
+
+inc	d
+dec	d
+jr	nz, tcp_nottoosmall
+ld	a, (iy + TCP_HSZ)
+and	&f0
+rrca
+rrca
+dec	a
+cp	e
+jp	nc, tcp_headertoobig
+
+.tcp_nottoosmall
+
+; Check checksum
+
+push	de
+call	cs_calctcpchecksum
+jp	nz, tcp_badchecksum
+pop	de
+
+; It's looking good!
+
+if	SHOW_INFO
+call	tcp_showinfo
+endif
+
+; Go through TCP bind list looking for match
+
+push	hl
+ld	hl, (tcp_client_head)
+call	ucp_dispatch
+pop	hl
+
+; Too bad...
+
+.tcp_closed
+
+if	SHOW_ERROR
+
+bit	TCP_RST_BIT, (iy + TCP_FLG)	; Discard if RST set
+ret	nz
+
+call	printstringimm
+defb	"TCP: segment on unbound local port ", 0
+ld	h, (iy + TCP_DST1)
+ld	l, (iy + TCP_DST0)
+call	printdec2
+call	printstringimm
+defb	" (or remote ", 0
+push	ix
+pop	hl
+ld	bc, IP_SRC3
+add	hl, bc
+call	printipaddr
+call	printstringimm
+defb	':', 0
+ld	h, (iy + TCP_SRC1)
+ld	l, (iy + TCP_SRC0)
+call	printdec2
+call	printstringimm
+defb	" rejected)", CR, LF, 0
+
+endif
+
+.tcp_send_reset
+
+; DE = TCP segment received size (needed only if no ACK)
+; IY -> TCP segment received
+; IX -> IP datagram received
+
+; Discard if RST set
+
+bit	TCP_RST_BIT, (iy + TCP_FLG)
+ret	nz
+
+; Send reset; type depends on presence of ACK
+
+bit	TCP_ACK_BIT, (iy + TCP_FLG)
+jr	nz, tcp_send_reset_ackpresent
+
+; If no ACK,
+; <SEQ = 0>
+; <ACK = SEGSEQ + SEGLEN>
+; <CTL = RST, ACK>
+
+call	tcp_ld_hl_seglen
+ld	a, (iy + TCP_SEQ0)
+add	a, l
+ld	(iy + TCP_ACK0), a
+ld	a, (iy + TCP_SEQ1)
+adc	a, h
+ld	(iy + TCP_ACK1), a
+ld	a, (iy + TCP_SEQ2)
+adc	a, 0
+ld	(iy + TCP_ACK2), a
+ld	a, (iy + TCP_SEQ3)
+adc	a, 0
+ld	(iy + TCP_ACK3), a
+ld	(iy + TCP_SEQ0), 0
+ld	(iy + TCP_SEQ1), 0
+ld	(iy + TCP_SEQ2), 0
+ld	(iy + TCP_SEQ3), 0
+ld	(iy + TCP_FLG), TCP_RST or TCP_ACK
+jr	tcp_send_reset_epilogue
+
+.tcp_send_reset_ackpresent
+
+; If ACK,
+; <SEQ = SEGACK>
+; <CTL = RST>
+
+ld	a, (iy + TCP_ACK0)
+ld	(iy + TCP_SEQ0), a
+ld	a, (iy + TCP_ACK1)
+ld	(iy + TCP_SEQ1), a
+ld	a, (iy + TCP_ACK2)
+ld	(iy + TCP_SEQ2), a
+ld	a, (iy + TCP_ACK3)
+ld	(iy + TCP_SEQ3), a
+ld	(iy + TCP_FLG), TCP_RST
+
+.tcp_send_reset_epilogue
+
+call	ucp_swapsrcdest
+ld	de, TCP_HDRSIZE
+push	de
+ld	(iy + TCP_HSZ), TCP_HSZ_MIN
+call	cs_settcpchecksum
+ld	(ix + IP_TTL), IP_DEFAULT_TTL
+call	ip_swapsrcdest
+pop	bc
+call	cs_setlengthandchecksum
+call	datalink_sendpacket
+
+.tcp_done
+
+ret
+
+
+.tcp_client_head
+
+defw	0
+
+
+.tcp_dispatch
+
+ld	a, (bc)
+cp	TCP_CLOSED_STATE
+jp	z, tcp_closed
+cp	TCP_SINK_STATE
+ret	z
+cp	TCP_SYNSENT_STATE
+jp	z, tcp_synsent
+cp	TCP_LISTEN_STATE
+jp	z, tcp_listn
+jp	tcp_core
+
+
+.tcp_close
+
+ld	a, (bc)
+
+cp	TCP_ESTABLISHED_STATE
+ld	d, TCP_FINWAIT1_STATE
+jr	z, tcp_close_ok
+
+cp	TCP_CLOSEWAIT_STATE
+ld	d, TCP_LASTACK_STATE
+jr	z, tcp_close_ok
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"Invalid tcp_close", CR, LF, 0
+endif
+
+ret
+
+.tcp_close_ok
+
+; Increment SNDNUN so we know when our FIN has been acked
+
+ld	a, d
+ld	(bc), a
+ld	(tcp_kick), a			; Relies on TCP_CLOSED_STATE being zero
+
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	e, (hl)
+inc	hl
+ld	d, (hl)
+inc	de
+ld	(hl), d
+dec	hl
+ld	(hl), e
+
+ret
+
+
+.tcp_abort
+
+call	tcp_remove
+cp	TCP_SYNRECEIVED_STATE
+jr	z, tcp_abort_do
+cp	TCP_ESTABLISHED_STATE
+jr	z, tcp_abort_do
+cp	TCP_FINWAIT1_STATE
+jr	z, tcp_abort_do
+cp	TCP_FINWAIT2_STATE
+jr	z, tcp_abort_do
+cp	TCP_CLOSEWAIT_STATE
+ret	nz
+
+.tcp_abort_do			; Send <SEQ = SNDNXT> <CTL = RST>
+
+ld	bc, UCP_OFFSETOF_EXTRA
+add	hl, bc
+ld	b, h
+ld	c, l
+
+call	tcp_constructcommon
+
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	e, (hl)
+inc	hl
+ld	d, (hl)
+
+ld	hl, TCP_OFFSETOF_SNDUNA
+add	hl, bc
+ld	a, (hl)
+add	a, e
+ld	(iy + TCP_SEQ0), a
+inc	hl
+ld	a, (hl)
+adc	a, d
+ld	(iy + TCP_SEQ1), a
+inc	hl
+ld	a, (hl)
+adc	a, 0
+ld	(iy + TCP_SEQ2), a
+inc	hl
+ld	a, (hl)
+adc	a, 0
+ld	(iy + TCP_SEQ3), a
+
+ld	(iy + TCP_FLG), TCP_RST
+ld	(iy + TCP_WIN1), 0
+ld	(iy + TCP_WIN0), 0
+
+ld	de, TCP_HDRSIZE
+push	de
+call	cs_settcpchecksum
+pop	bc
+call	cs_setlengthandchecksum
+jp	datalink_sendpacket
+
+
+.tcp_constructcommon
+
+ld	ix, iptxbuffer		; Set up IP header
+ld	(ix + IP_VERIHL), &45
+ld	(ix + IP_TOS), 0
+ld	(ix + IP_FRG1), IP_DF
+ld	(ix + IP_FRG0), 0
+ld	(ix + IP_TTL), IP_DEFAULT_TTL
+ld	(ix + IP_PRT), IP_TCP
+
+ld	a, (config_hostaddr + 0)
+ld	(ix + IP_SRC3), a
+ld	a, (config_hostaddr + 1)
+ld	(ix + IP_SRC2), a
+ld	a, (config_hostaddr + 2)
+ld	(ix + IP_SRC1), a
+ld	a, (config_hostaddr + 3)
+ld	(ix + IP_SRC0), a
+
+ld	hl, -UCP_OFFSETOF_EXTRA + UCP_OFFSETOF_REMADDR
+add	hl, bc
+ld	a, (hl)
+ld	(ix + IP_DST3), a
+inc	hl
+ld	a, (hl)
+ld	(ix + IP_DST2), a
+inc	hl
+ld	a, (hl)
+ld	(ix + IP_DST1), a
+inc	hl
+ld	a, (hl)
+ld	(ix + IP_DST0), a
+
+ld	iy, iptxbuffer + IP_HDRSIZE	; Set up TCP header
+
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_DST1), a
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_DST0), a
+
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_SRC1), a
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_SRC0), a
+
+ld	(iy + TCP_HSZ), TCP_HSZ_MIN
+
+ret
+
+
+.tcp_synsent
+
+; If the ACK bit is set, then if not in window,
+; send reset (unless RST also set) and drop segment
+
+bit	TCP_ACK_BIT, (iy + TCP_FLG)
+jr	z, tcp_synsent_noack
+; Note that in the open we've fudged SNDUNA to be ISS + 1,
+; and we didn't send any data, so we expect SEGACK == SNDUNA.
+call	tcp_cp_segack_snduna
+jp	nz, tcp_send_reset
+.tcp_synsent_noack
+
+; If the RST bit is set...
+
+bit	TCP_RST_BIT, (iy + TCP_FLG)
+jr	nz, tcp_synsent_gotrst
+
+; If the SYN bit is clear drop segment
+
+bit	TCP_SYN_BIT, (iy + TCP_FLG)
+ret	z
+
+; If the ACK bit is not set then it's a simultaneous connection
+
+bit	TCP_ACK_BIT, (iy + TCP_FLG)
+jp	z, tcp_send_reset
+
+; FIXME if want to support simultaneous connection, then:
+; jr	z, tcp_synsent_noack2		; Move to SYNRECEIVED, etc.
+
+; Notify the app that the fun is about to start
+
+ld	d, TCP_SENT_INIT
+ld	hl, TCP_OFFSETOF_SENTUP
+call	tcp_upcall
+
+; Move to ESTABLISHED
+; RCVNXT = SEGSEQ + 1
+; Note that in the open we've fudged SNDUNA to be ISS + 1,
+; and we haven't sent any data, so we don't need to change it.
+; FIXME should check for URG/PSH/FIN?, handle data
+
+ld	a, TCP_ESTABLISHED_STATE
+ld	(bc), a
+
+call	tcp_ld_rcvnxt_segseq_plus_one
+
+jp	tcp_resend
+
+.tcp_synsent_gotrst
+
+; If no ACK, drop segment
+
+bit	TCP_ACK_BIT, (iy + TCP_FLG)
+ret	z
+
+; Delete TCB and notify remote refusal
+
+ld	d, TCP_CLOSE_REFUSED
+
+.tcp_remove_and_notify
+
+ld	hl, -UCP_OFFSETOF_EXTRA
+add	hl, bc
+call	tcp_remove
+
+ld	hl, TCP_OFFSETOF_CLOSUP
+jp	tcp_upcall
+
+
+.tcp_listn
+
+; Ignore incoming RSTs
+
+bit	TCP_RST_BIT, (iy + TCP_FLG)
+ret	nz
+
+; Send a reset for any incoming ACKs
+
+bit	TCP_ACK_BIT, (iy + TCP_FLG)
+jp	nz, tcp_send_reset
+
+; Ignore packets without SYN or ACK
+
+bit	TCP_SYN_BIT, (iy + TCP_FLG)
+ret	z
+
+; Give the app a chance to reject the connection
+
+ld	hl, TCP_OFFSETOF_CONNUP
+push	de
+call	tcp_upcall
+pop	de
+jp	nc, tcp_send_reset
+
+; Here we go!
+
+; Store the peer details
+
+ld	hl, -UCP_OFFSETOF_EXTRA + UCP_OFFSETOF_REMADDR
+add	hl, bc
+ld	a, (ix + IP_SRC3)
+ld	(hl), a
+inc	hl
+ld	a, (ix + IP_SRC2)
+ld	(hl), a
+inc	hl
+ld	a, (ix + IP_SRC1)
+ld	(hl), a
+inc	hl
+ld	a, (ix + IP_SRC0)
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_SRC1)
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_SRC0)
+ld	(hl), a
+
+; Move to SYNRECEIVED
+; RCVNXT = SEGSEQ + 1
+; SNDUNA = ISS + 1 (fudge)
+; FIXME check aborts will work OK with fudge
+
+ld	a, TCP_SYNRECEIVED_STATE
+ld	(bc), a
+
+call	tcp_ld_rcvnxt_segseq_plus_one
+
+ld	ix, TCP_OFFSETOF_SNDUNA
+add	ix, bc
+call	KL_TIME_PLEASE
+ld	(ix + 0), l
+ld	(ix + 1), h
+ld	(ix + 2), e
+ld	(ix + 3), d
+
+jp	tcp_resend
+
+
+.tcp_kick
+
+defs	1
+
+
+.tcp_core
+
+; tcp_kick tells us whether we need to send a response to this segment
+
+xor	a
+ld	(tcp_kick), a
+
+call	tcp_ld_hl_seglen
+push	hl				; SEGLEN
+
+if	SHOW_INFO or MARK_HACKS or 0
+if	MARK_HACKS
+ld	a, (tcp_trace)
+or	a
+jp	z, tcp_trace_off
+endif
+ld	a, (bc)
+call	printdec
+call	printstringimm
+defb	" GLEN", 0
+call	printhex2
+call	printstringimm
+defb	" RWND", 0
+ld	hl, TCP_OFFSETOF_RCVWND
+add	hl, bc
+ld	a, (hl)
+inc	hl
+ld	h, (hl)
+ld	l, a
+call	printhex2
+call	printstringimm
+defb	" GACK", 0
+ld	h, (iy + TCP_ACK3)
+ld	l, (iy + TCP_ACK2)
+call	printhex2
+ld	h, (iy + TCP_ACK1)
+ld	l, (iy + TCP_ACK0)
+call	printhex2
+call	printstringimm
+defb	" SUNA", 0
+ld	hl, TCP_OFFSETOF_SNDUNA + 3
+add	hl, bc
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+call	printstringimm
+defb	" SNUN", 0
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	a, (hl)
+inc	hl
+ld	h, (hl)
+ld	l, a
+call	printhex2
+call	printstringimm
+defb	" GSEQ", 0
+ld	h, (iy + TCP_SEQ3)
+ld	l, (iy + TCP_SEQ2)
+call	printhex2
+ld	h, (iy + TCP_SEQ1)
+ld	l, (iy + TCP_SEQ0)
+call	printhex2
+call	printstringimm
+defb	" RNXT", 0
+ld	hl, TCP_OFFSETOF_RCVNXT + 3
+add	hl, bc
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+;call	printcrlf			; Not needed because exactly 80 chars!
+.tcp_trace_off
+endif
+
+; Compute SEGSEQ - RCVNXT; this will be
+; - 0 for a spot-on segment
+; - +ve for a segment with premature data
+; - -ve for a segment with old data
+ld	hl, TCP_OFFSETOF_RCVNXT
+add	hl, bc
+ld	e, (hl)
+inc	hl
+ld	d, (hl)
+push	hl
+ld	h, (iy + TCP_SEQ1)
+ld	l, (iy + TCP_SEQ0)
+sbc	hl, de				; C clear from ADD above
+ex	(sp), hl			; Stack holds LSW
+inc	hl
+ld	e, (hl)
+inc	hl
+ld	d, (hl)
+ld	h, (iy + TCP_SEQ3)
+ld	l, (iy + TCP_SEQ2)
+sbc	hl, de				; Z if MSW zero
+pop	de				; DE = SEGSEQ - RCVNXT
+scf					; For tcp_just_maybe_acceptable hack
+jr	nz, tcp_just_maybe_acceptable_if_negative ; LIMIT#1
+
+ld	hl, TCP_OFFSETOF_RCVWND
+add	hl, bc
+ld	a, (hl)
+inc	hl
+ld	h, (hl)
+ld	l, a				; HL = RCVWND
+or	h
+jr	z, tcp_rcvwnd_is_zero
+
+; If RCVWND != 0, then segment is acceptable if
+;    0 <= SEGSEQ - RCVNXT < RCVWND or
+;    (if SEGLEN != 0) 0 <= SEGSEQ - RCVNXT + SEGLEN - 1 < RCVWND
+; I can't be bothered with the second check for now (see _if_negative)!
+; This means that segments with some old data will not be accepted. LIMIT#3
+
+inc	de
+sbc	hl, de				; C clear from OR above
+dec	de
+
+.tcp_just_maybe_acceptable_if_negative	; LIMIT#3
+
+pop	hl				; HL = SEGLEN
+jr	nc, tcp_acceptable
+
+.tcp_not_acceptable
+
+bit	TCP_RST_BIT, (iy + TCP_FLG)
+ret	nz
+
+jp	tcp_resend
+
+.tcp_rcvwnd_is_zero
+
+; If RCVWND == 0, then segment is not acceptable if
+;    SEGLEN != 0 or SEGSEQ - RCVNXT != 0.
+
+pop	hl				; HL = SEGLEN
+ld	a, h
+or	l
+or	d
+or	e
+jr	nz, tcp_not_acceptable
+
+.tcp_acceptable
+
+; Drop segment if it doesn't start at RCVNXT
+; (not spec violation, merely spec defiance!)
+
+ld	a, d
+or	e
+ret	nz
+
+; If the RST bit is set...
+
+bit	TCP_RST_BIT, (iy + TCP_FLG)
+jp	nz, tcp_reset
+
+; If the SYN bit is set...
+
+bit	TCP_SYN_BIT, (iy + TCP_FLG)
+jp	nz, tcp_synagain
+
+; If the ACK bit is not set, drop segment
+
+bit	TCP_ACK_BIT, (iy + TCP_FLG)
+ret	z
+
+; If in SYNRECEIVED state move to ESTABLISHED state
+; FIXME need to send reset if in SYNRECEIVED and not valid ACK. LIMIT#4
+
+ld	a, (bc)
+cp	TCP_SYNRECEIVED_STATE
+jr	nz, $ + 5
+ld	a, TCP_ESTABLISHED_STATE
+ld	(bc), a
+
+; Validate the ACK
+
+push	hl				; SEGLEN
+
+; Compute SEGACK - SNDUNA; this will be
+; - 0 or -ve for a duplicate ack
+; - SNDNUN for a spot-on ack
+; - between 0 and SNDNUN (exclusive) for a good ack
+; - more than SNDNUN for a premature ack
+ld	hl, TCP_OFFSETOF_SNDUNA
+add	hl, bc
+ld	e, (hl)
+inc	hl
+ld	d, (hl)
+push	hl
+ld	h, (iy + TCP_ACK1)
+ld	l, (iy + TCP_ACK0)
+sbc	hl, de				; C clear from ADD above
+ex	(sp), hl			; Stack holds LSW
+inc	hl
+ld	e, (hl)
+inc	hl
+ld	d, (hl)
+ld	h, (iy + TCP_ACK3)
+ld	l, (iy + TCP_ACK2)
+sbc	hl, de				; Z if MSW zero, S set if -ve
+pop	de				; DE = number of acked octets
+
+jp	m, tcp_duplicate_ack		; Ignore ack if SEGACK < SNDUNA
+jp	nz, tcp_premature_ack		; Resend if SEGACK - SNDUNA > SNDNUN
+ld	a, d
+or	e
+jr	z, tcp_duplicate_ack		; Ignore ack if SEGACK == SNDUNA
+; Note this treats ACKs when SNDNUN == 0 as duplicates
+; FIXME is that safe (esp. in SYNRECEIVED state)?
+
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	a, (hl)
+inc	hl
+ld	h, (hl)
+ld	l, a
+sbc	hl, de				; C clear from ADD above
+jp	c, tcp_premature_ack		; Resend if SEGACK - SNDUNA > SNDNUN
+jr	z, tcp_exact_ack
+
+; We've been partially acked (DE octets acked, HL octets still to ack),
+; so we need to squish SNDBUF down
+push	bc
+push	hl
+push	hl
+ld	hl, TCP_OFFSETOF_SNDBUF
+add	hl, bc				; HL -> SNDBUF
+push	hl
+add	hl, de				; HL -> first still to ack in SNDBUF
+pop	de				; DE -> SNDBUF
+pop	bc				; BC = octets still to ack
+ldir
+pop	hl
+pop	bc
+
+.tcp_exact_ack
+
+ex	de, hl				; DE = new SNDNUN
+
+; SNDUNA = SEGACK
+ld	hl, TCP_OFFSETOF_SNDUNA
+add	hl, bc
+ld	a, (iy + TCP_ACK0)
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_ACK1)
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_ACK2)
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_ACK3)
+ld	(hl), a
+
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	(hl), e
+inc	hl
+ld	(hl), d
+
+push	hl
+ld	d, TCP_SENT_NORMAL
+ld	hl, TCP_OFFSETOF_SENTUP
+call	tcp_upcall
+pop	hl
+ld	a, (tcp_kick)
+or	(hl)
+dec	hl
+or	(hl)
+ld	(tcp_kick), a
+
+; If tcp_close called from upcall, SNDNUN will be non-zero
+; and hence so will A; in this case skip the FIN ack tests
+
+jr	nz, tcp_fin_not_acked
+
+; If our FIN acked in LASTACK, delete TCB and notify normal close
+
+ld	a, (bc)
+cp	TCP_LASTACK_STATE
+jr	nz, tcp_not_lastack
+
+pop	hl				; HL = SEGLEN
+
+ld	d, TCP_CLOSE_NORMAL
+jp	tcp_remove_and_notify
+
+.tcp_fin_not_acked
+
+pop	hl				; HL = SEGLEN
+
+jr	tcp_duplicate_ack_not_synreceived
+
+.tcp_duplicate_ack
+
+pop	hl				; HL = SEGLEN
+
+; If receive unacceptable ACK in SYNRECEIVED, send reset
+; FIXME but not return to LISTEN?
+ld	a, (bc)
+cp	TCP_SYNRECEIVED_STATE
+jp	z, tcp_send_reset
+
+jr	tcp_duplicate_ack_not_synreceived
+
+.tcp_not_lastack
+
+; If our FIN acked in FINWAIT1, move to FINWAIT2
+
+cp	TCP_FINWAIT1_STATE
+jr	nz, tcp_not_finwait1
+
+ld	a, TCP_FINWAIT2_STATE
+ld	(bc), a
+
+.tcp_not_finwait1
+
+; If our FIN acked in CLOSING, delete TCB and notify normal close
+; Should really move to TIMEWAIT.  LIMIT#5
+
+pop	hl				; HL = SEGLEN
+
+cp	TCP_CLOSING_STATE
+jr	z, tcp_faketimewait
+
+.tcp_duplicate_ack_not_synreceived
+
+ld	a, h
+or	l
+jr	z, tcp_nodata
+
+; If data arrives in CLOSEWAIT, CLOSING, LASTACK or TIMEWAIT, ignore it
+
+ld	a, (bc)
+cp	TCP_CLOSEWAIT_STATE		; Relies on state ordering
+jr	nc, tcp_nodata
+
+; FIXME need to trim any portion beyond RCVWND
+
+ex	de, hl
+ld	hl, TCP_OFFSETOF_RCVNXT
+add	hl, bc
+ld	a, (hl)
+add	a, e
+ld	(hl), a
+inc	hl
+ld	a, (hl)
+adc	a, d
+ld	(hl), a
+inc	hl
+ld	a, (hl)
+adc	a, 0
+ld	(hl), a
+inc	hl
+ld	a, (hl)
+adc	a, 0
+ld	(hl), a
+
+bit	TCP_FIN_BIT, (iy + TCP_FLG)
+jr	z, $ + 3
+dec	de				; Don't pass FIN to app
+
+; Send an ACK while the app processes the data, to parallelise things
+
+push	bc
+push	de
+push	ix
+push	iy
+xor	a
+ld	(tcp_kick), a
+call	tcp_resend_ackonly
+pop	iy
+pop	ix
+pop	de
+pop	bc
+
+push	iy
+ld	a, (iy + TCP_HSZ)
+and	&f0
+rrca
+rrca
+ex	de, hl
+ld	e, a
+ld	d, 0
+add	iy, de
+ex	de, hl
+
+; IY -> data
+; DE = data length
+ld	hl, TCP_OFFSETOF_RECVUP
+call	tcp_upcall
+
+if	1
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	a, (tcp_kick)
+or	(hl)
+inc	hl
+or	(hl)
+ld	(tcp_kick), a
+else
+call	tcp_ld_hl_sndnun_excluding_fin
+ld	a, (tcp_kick)
+or	h
+or	l
+ld	(tcp_kick), a
+endif
+
+pop	iy
+
+.tcp_nodata
+
+; Is there a FIN bit?
+
+bit	TCP_FIN_BIT, (iy + TCP_FLG)
+jr	z, tcp_notfin
+
+; Ignore FIN in CLOSED, LISTEN or SYNSENT state (relies on ordering)
+; FIXME check whether it's possible to have reverted to any of these states
+
+ld	a, (bc)
+cp	TCP_SYNSENT_STATE + 1
+jr	c, tcp_notfin
+
+; In SYNRECEIVED or ESTABLISHED move to CLOSEWAIT state and notify remote close
+
+cp	TCP_ESTABLISHED_STATE
+jr	z, tcp_fin_established
+cp	TCP_SYNRECEIVED_STATE
+jr	z, tcp_fin_established
+
+; In FINWAIT1 move to CLOSING state
+; Note the fact that we're still in FINWAIT1 implies our FIN hasn't been acked
+
+cp	TCP_FINWAIT1_STATE
+jr	nz, $ + 5
+ld	a, TCP_CLOSING_STATE
+ld	(bc), a
+
+; In FINWAIT2 delete TCB and notify normal close
+; Should really move to TIMEWAIT.  LIMIT#5
+
+cp	TCP_FINWAIT2_STATE
+jr	nz, tcp_fin_notfinwait2
+
+.tcp_faketimewait
+
+ld	d, TCP_CLOSE_NORMAL
+jp	tcp_remove_and_notify
+
+.tcp_fin_notfinwait2
+
+; Otherwise, remain in the same state
+
+.tcp_notfin
+
+ld	a, (tcp_kick)
+or	a
+jr	nz, tcp_resend
+ld	hl, TCP_OFFSETOF_RETXTO
+add	hl, bc
+jp	timeout_stop
+
+.tcp_fin_established
+
+; In SYNRECEIVED or ESTABLISHED move to CLOSEWAIT state and notify remote close
+
+ld	a, TCP_CLOSEWAIT_STATE
+ld	(bc), a
+
+ld	hl, TCP_OFFSETOF_CLOSUP
+ld	d, TCP_CLOSE_REMOTE
+call	tcp_upcall
+
+jr	tcp_notfin
+
+.tcp_premature_ack
+
+pop	hl				; HL = SEGLEN
+
+; If receive unacceptable ACK in SYNRECEIVED, send reset
+; FIXME but not return to LISTEN?
+ld	a, (bc)
+cp	TCP_SYNRECEIVED_STATE
+jp	z, tcp_send_reset
+
+; In other states, send an ACK and drop segment
+
+jr	tcp_resend
+
+
+.tcp_reset
+
+ld	a, (bc)
+cp	TCP_SYNRECEIVED_STATE
+jr	z, tcp_reset_synreceived
+
+.tcp_synagain_otherwise
+
+; If ESTABLISHED, FINWAITn or CLOSEWAIT delete TCB and notify reset.
+; If CLOSING, LASTACK or TIMEWAIT delete TCB and notify normal close.
+
+ld	d, TCP_CLOSE_RESET
+cp	TCP_CLOSING_STATE		; Relies on state ordering
+jr	c, $ + 4
+ld	d, TCP_CLOSE_NORMAL
+jp	tcp_remove_and_notify
+
+.tcp_reset_synreceived
+
+; If SYNRECEIVED return to LISTEN if passive (LIMIT#3).
+
+ld	a, TCP_LISTEN_STATE
+ld	(bc), a
+ret
+
+.tcp_synagain
+
+; If SYNRECEIVED return to LISTEN if passive (LIMIT#3).
+
+ld	a, (bc)
+cp	TCP_SYNRECEIVED_STATE
+jr	z, tcp_reset_synreceived
+
+; Otherwise notify reset.
+
+ld	a, TCP_ESTABLISHED_STATE	; Only slightly hacky!
+jr	tcp_synagain_otherwise
+
+
+.tcp_resend_ackonly
+
+call	tcp_constructcommon
+
+call	tcp_resend_whichflags
+res	TCP_FIN_BIT, d
+ld	(iy + TCP_FLG), d
+
+ld	de, 0
+push	de
+jr	tcp_resend_nooctets
+
+
+.tcp_send
+
+; On entry:
+;	BC -> TCB
+;	DE = previous SNDNUN
+
+ld	a, d
+or	e
+ret	nz
+
+
+.tcp_send_now
+
+; On entry:
+;	BC -> TCB
+
+.tcp_resend
+
+call	tcp_constructcommon
+
+call	tcp_resend_whichflags
+ld	(iy + TCP_FLG), d
+
+ld	a, (bc)
+ld	hl, 0
+cp	TCP_SYNSENT_STATE	; FIXME improve synsent ACK check to allow data
+call	nz, tcp_ld_hl_sndnun_excluding_fin
+push	hl
+ld	a, h
+or	l
+jr	z, tcp_resend_nooctets
+
+ex	de, hl
+ld	hl, TCP_OFFSETOF_SNDBUF
+add	hl, bc
+set	TCP_PSH_BIT, (iy + TCP_FLG)
+set	TCP_DAT_BIT, (iy + TCP_FLG)
+push	bc
+ld	b, d
+ld	c, e
+ld	de, iptxbuffer + IP_HDRSIZE + TCP_HDRSIZE
+ldir
+xor	a
+ld	(de), a			; For odd buffers
+pop	bc
+
+.tcp_resend_nooctets
+
+; (Re)start the retransmission timeout if there is any data to send,
+; including any SYN or FIN, else stop it.
+
+ld	a, (iy + TCP_FLG)
+and	TCP_DAT or TCP_SYN or TCP_FIN
+res	TCP_DAT_BIT, (iy + TCP_FLG)
+jr	z, tcp_resend_noretxto
+
+ld	hl, TCP_OFFSETOF_RETXTO
+add	hl, bc
+ld	de, TCP_RTO
+call	nz, timeout_set
+
+.tcp_resend_noretxto
+
+ld	d, 0
+bit	TCP_SYN_BIT, (iy + TCP_FLG)
+jr	z, $ + 4
+ld	d, 1
+
+ld	hl, TCP_OFFSETOF_SNDUNA
+add	hl, bc
+ld	a, (hl)
+sub	d
+ld	(iy + TCP_SEQ0), a
+inc	hl
+ld	a, (hl)
+sbc	a, 0
+ld	(iy + TCP_SEQ1), a
+inc	hl
+ld	a, (hl)
+sbc	a, 0
+ld	(iy + TCP_SEQ2), a
+inc	hl
+ld	a, (hl)
+sbc	a, 0
+ld	(iy + TCP_SEQ3), a
+
+ld	hl, TCP_OFFSETOF_RCVNXT
+add	hl, bc
+ld	a, (hl)
+ld	(iy + TCP_ACK0), a
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_ACK1), a
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_ACK2), a
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_ACK3), a
+
+if	SHOW_INFO or MARK_HACKS or 0
+if	MARK_HACKS
+ld	a, (tcp_trace)
+or	a
+jr	z, tcp_trace_off2
+endif
+ld	a, (bc)
+call	printdec
+call	printstringimm
+defb	" GLEN", 0
+pop	hl
+push	hl
+call	printhex2
+call	printstringimm
+defb	" GFLG", 0
+ld	a, (iy + TCP_FLG)
+call	printhex
+call	printstringimm
+defb	"   GSEQ", 0
+ld	a, (iy + TCP_SEQ3)
+call	printhex
+ld	a, (iy + TCP_SEQ2)
+call	printhex
+ld	a, (iy + TCP_SEQ1)
+call	printhex
+ld	a, (iy + TCP_SEQ0)
+call	printhex
+call	printstringimm
+defb	"                       GACK", 0
+ld	a, (iy + TCP_ACK3)
+call	printhex
+ld	a, (iy + TCP_ACK2)
+call	printhex
+ld	a, (iy + TCP_ACK1)
+call	printhex
+ld	a, (iy + TCP_ACK0)
+call	printhex
+call	printcrlf
+.tcp_trace_off2
+endif
+
+ld	hl, TCP_OFFSETOF_RCVWND
+add	hl, bc
+ld	a, (hl)
+ld	(iy + TCP_WIN0), a
+inc	hl
+ld	a, (hl)
+ld	(iy + TCP_WIN1), a
+
+pop	de
+
+ld	hl, TCP_HDRSIZE
+add	hl, de
+ex	de, hl
+push	de
+call	cs_settcpchecksum
+pop	bc
+call	cs_setlengthandchecksum
+jp	datalink_sendpacket
+
+
+.tcp_resend_whichflags
+
+ld	a, (bc)
+
+cp	TCP_ESTABLISHED_STATE
+ld	d, TCP_ACK
+ret	z
+
+cp	TCP_SYNSENT_STATE
+ld	d,           TCP_SYN
+ret	z
+
+cp	TCP_SYNRECEIVED_STATE
+ld	d, TCP_ACK + TCP_SYN
+ret	z
+
+cp	TCP_FINWAIT1_STATE
+ld	d, TCP_ACK           + TCP_FIN
+ret	z
+
+cp	TCP_CLOSING_STATE
+ret	z
+
+cp	TCP_LASTACK_STATE
+ret	z
+
+ld	d, TCP_ACK
+ret
+
+
+.tcp_upcall
+
+; TCP upcall
+;
+; On entry:
+;	BC -> TCB
+;	HL -> offset of upcall
+;	BC, DE, IX, IY preserved into upcall
+; On exit:
+;	AF, DE, HL as returned by upcall
+
+push	bc
+push	ix
+push	iy
+
+add	hl, bc
+ld	a, (hl)
+inc	hl
+ld	h, (hl)
+ld	l, a
+call	callhl
+
+pop	iy
+pop	ix
+pop	bc
+
+ret
+
+
+.tcp_maysend
+
+; May data be added to SNDBUF?
+;
+; On entry:
+;	BC -> TCB
+; On exit:
+;	C set iff may send, other flags corrupted
+
+push	af
+ld	a, (bc)
+or	a				; Relies on TCP_CLOSED_STATE being zero
+jr	z, tcp_maysend_not
+cp	TCP_CLOSEWAIT_STATE
+jr	z, tcp_maysend_yes
+cp	TCP_ESTABLISHED_STATE + 1
+jr	nc, tcp_maysend_not
+
+.tcp_maysend_yes
+pop	af
+scf
+ret
+
+.tcp_maysend_not
+pop	af
+or	a
+ret
+
+
+.tcp_retxto
+
+; TCP retransmission timeout has fired!
+;
+; On entry:
+;	DE -> struct timeout RETXTO
+
+ld	hl, -TCP_OFFSETOF_RETXTO
+add	hl, de
+ld	b, h
+ld	c, l
+jp	tcp_resend
+
+
+.tcp_listen
+
+; TCP passive open
+;
+; On entry:
+;	HL -> bind structure (may be partially-specified)
+; On exit:
+;	AF, BC, DE, HL, IX, IY corrupted
+;
+; No check is made that the given bind structure isn't already
+; on the bind list -- ensure this doesn't happen!
+;
+; See tcp_bind for the format of the bind structure
+
+scf
+call	tcp_bind
+
+ld	de, UCP_OFFSETOF_HANDLER
+add	hl, de
+
+ld	(hl), tcp_dispatch and &ff
+inc	hl
+ld	(hl), tcp_dispatch / 256
+inc	hl
+ld	(hl), TCP_LISTEN_STATE
+
+ret
+
+
+.tcp_sink
+
+; TCP sink
+;
+; On entry:
+;	HL -> bind structure (may be partially-specified)
+; On exit:
+;	AF, BC, DE, HL, IX, IY corrupted
+;
+; No check is made that the given bind structure isn't already
+; on the bind list -- ensure this doesn't happen!
+;
+; See tcp_bind for the format of the bind structure -- only the
+; parts up to the state are needed
+;
+; Call this before calling tcp_listen
+
+or	a
+call	tcp_bind
+
+ld	de, UCP_OFFSETOF_HANDLER
+add	hl, de
+
+ld	(hl), tcp_dispatch and &ff
+inc	hl
+ld	(hl), tcp_dispatch / 256
+inc	hl
+ld	(hl), TCP_SINK_STATE
+
+ret
+
+
+.tcp_connect
+
+; TCP active open
+;
+; On entry:
+;	HL -> bind structure (must be fully-specified)
+; On exit:
+;	AF, BC, DE, HL, IX, IY corrupted
+;
+; No check is made that the given bind structure isn't already
+; on the bind list -- ensure this doesn't happen!
+;
+; See tcp_bind for the format of the bind structure
+
+scf
+call	tcp_bind
+
+ld	bc, UCP_OFFSETOF_HANDLER
+add	hl, bc
+ld	(hl), tcp_dispatch and &ff
+inc	hl
+ld	(hl), tcp_dispatch / 256
+inc	hl
+ld	(hl), TCP_SYNSENT_STATE
+
+; Note SNDUNA is set to ISS + 1
+ld	b, h
+ld	c, l
+ld	ix, TCP_OFFSETOF_SNDUNA
+add	ix, bc
+call	KL_TIME_PLEASE
+ld	(ix + 0), l
+ld	(ix + 1), h
+ld	(ix + 2), e
+ld	(ix + 3), d
+
+jp	tcp_resend
+
+
+.tcp_bind
+
+; TCP bind
+;
+; On entry:
+;	HL -> bind structure
+;	C set iff want to create timeout object
+;
+; On exit:
+;	All regs preserved
+;
+; No check is made that the given bind structure isn't already
+; on the bind list -- ensure this doesn't happen!
+;
+; The bind structure is:
+;	word	next		(system use; don't ever write to it)
+;	dword	remaddr		(big-endian)
+;	word	remport		(big-endian)
+;	word	locport		(big-endian)
+;	word	handler		(little-endian; don't ever write to it)
+;	TCB	tcb		(mostly opaque)
+;
+; The first octet of the remaddr and the two octets of the remport
+; may independently be set to all-zeroes to mean "any".
+; The octets of the remaddr and the remport may all be set to
+; all-ones to mean "none" (effectively temporarily suspending the TCP bind).
+
+push	ix
+push	de
+ld	ix, tcp_client_head
+call	ll_insert
+jr	nc, tcp_bind_noretxto
+push	af
+push	bc
+push	hl
+ld	bc, UCP_OFFSETOF_EXTRA + TCP_OFFSETOF_RETXTO
+add	hl, bc
+ld	de, tcp_retxto
+call	timeout_create
+pop	hl
+pop	bc
+pop	af
+.tcp_bind_noretxto
+pop	de
+pop	ix
+ret
+
+
+.tcp_remove
+
+; TCP remove from bind list
+;
+; On entry:
+;	HL -> bind structure
+;
+; On exit:
+;	A = state prior to remove
+;	F corrupted
+;
+; If the structure isn't on the bind list, nothing happens.
+
+push	ix
+ld	ix, tcp_client_head
+call	ll_remove
+pop	ix
+push	bc
+push	de
+push	hl
+ld	bc, UCP_OFFSETOF_EXTRA + TCP_OFFSETOF_RETXTO
+add	hl, bc
+call	timeout_destroy
+pop	de
+ld	hl, UCP_OFFSETOF_EXTRA + TCP_OFFSETOF_STATE
+add	hl, de
+ld	a, (hl)
+ld	(hl), TCP_CLOSED_STATE
+ex	de, hl
+pop	de
+pop	bc
+ret
+
+
+.tcp_ld_hl_sndnun_excluding_fin
+
+; On entry:
+;	BC -> TCB
+; On exit:
+;	HL = SNDNUN excluding any FIN
+;	AF corrupted
+;
+; Note that if SNDNUN should be zero while a FIN is present
+; (which is an illegal combination), zero will be returned.
+
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	a, (hl)
+inc	hl
+ld	h, (hl)
+ld	l, a
+or	h
+ret	z
+
+ld	a, (bc)
+cp	TCP_FINWAIT1_STATE
+jr	z, tcp_ld_hl_sndnun_fin
+cp	TCP_CLOSING_STATE
+jr	z, tcp_ld_hl_sndnun_fin
+cp	TCP_LASTACK_STATE
+ret	nz
+
+.tcp_ld_hl_sndnun_fin
+
+dec	hl
+
+ret
+
+
+.tcp_ld_hl_seglen
+
+; On entry:
+;	DE = TCP segment size
+;	IY -> TCP segment
+; On exit:
+;	HL = SEGLEN (TCP segment data size, including SYN and FIN)
+
+push	af
+push	de
+
+ld	a, (iy + TCP_HSZ)
+and	&f0
+rrca
+rrca
+
+ld	h, 0
+ld	l, a
+ex	de, hl
+sbc	hl, de			; C cleared by AND/RRCA above
+
+bit	TCP_SYN_BIT, (iy + TCP_FLG)
+jr	z, $ + 3
+inc	hl
+
+bit	TCP_FIN_BIT, (iy + TCP_FLG)
+jr	z, $ + 3
+inc	hl
+
+pop	de
+pop	af
+ret
+
+
+.tcp_ld_rcvnxt_segseq_plus_one
+
+; On entry:
+;	BC -> TCB
+;	IY -> TCP segment
+; On exit:
+;	RCVNXT = SEGSEQ + 1
+;	AF, HL corrupted
+
+ld	hl, TCP_OFFSETOF_RCVNXT
+add	hl, bc
+ld	a, (iy + TCP_SEQ0)
+add	a, 1
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_SEQ1)
+adc	a, 0
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_SEQ2)
+adc	a, 0
+ld	(hl), a
+inc	hl
+ld	a, (iy + TCP_SEQ3)
+adc	a, 0
+ld	(hl), a
+
+ret
+
+
+.tcp_cp_segack_snduna
+
+; On entry:
+;	BC -> TCB
+;	IY -> TCP segment
+; On exit:
+;	Z set iff SEGACK == SNDUNA
+;	A, HL and other flags corrupted
+
+ld	hl, TCP_OFFSETOF_SNDUNA
+add	hl, bc
+ld	a, (hl)
+sub	(iy + TCP_ACK0)
+inc	hl
+ld	a, (hl)
+sbc	a, (iy + TCP_ACK1)
+inc	hl
+ld	a, (hl)
+sbc	a, (iy + TCP_ACK2)
+inc	hl
+ld	a, (hl)
+sbc	a, (iy + TCP_ACK3)
+ret
+
+
+if	MARK_HACKS
+
+.tcp_toggle_trace
+
+pop	hl			; For push bc
+
+ld	a, (tcp_trace)
+xor	1
+ld	(tcp_trace), a
+
+ret	z
+
+call	printcrlfmaybe
+ld	a, (bc)
+call	printdec
+call	printstringimm
+defb	"                                SUNA", 0
+ld	hl, TCP_OFFSETOF_SNDUNA + 3
+add	hl, bc
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+call	printstringimm
+defb	" SNUN", 0
+ld	hl, TCP_OFFSETOF_SNDNUN
+add	hl, bc
+ld	a, (hl)
+inc	hl
+ld	h, (hl)
+ld	l, a
+call	printhex2
+call	printstringimm
+defb	"              RNXT", 0
+ld	hl, TCP_OFFSETOF_RCVNXT + 3
+add	hl, bc
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+dec	hl
+ld	a, (hl)
+call	printhex
+;call	printcrlf			; Not needed because exactly 80 chars!
+ret
+
+.tcp_trace
+
+defb	0
+
+endif
+
+
+if	SHOW_ERROR
+
+.tcp_badchecksum
+
+call	printstringimm
+defb	"TCP: bad checksum: &", 0
+pop	hl
+ex	de, hl
+jp	printhex2crlf
+
+.tcp_toosmall
+
+call	printstringimm
+defb	"TCP: segment too small: ", 0
+ld	a, e
+call	printdec
+jp	printcrlf
+
+.tcp_headertoobig
+
+inc	a
+call	printstringimm
+defb	"TCP: header bigger than segment: declared &00", 0
+call	printhex
+call	printstringimm
+defb	" vs. actual &", 0
+ex	de, hl
+jp	printhex2crlf
+
+else
+
+tcp_badchecksum		equ	tcp_done
+tcp_toosmall		equ	tcp_done
+tcp_headertoobig	equ	tcp_done
+
+endif
+
+
+if	SHOW_INFO
+
+.tcp_showinfo
+
+push	hl
+
+call	printstringimm
+defb	"TCP: segment size: &", 0
+ex	de, hl
+call	printhex2crlf
+ex	de, hl
+
+call	printstringimm
+defb	"TCP: source port: ", 0
+ld	h, (iy + TCP_SRC1)
+ld	l, (iy + TCP_SRC0)
+call	printdec2
+call	printcrlf
+
+call	printstringimm
+defb	"TCP: dest port:   ", 0
+ld	h, (iy + TCP_DST1)
+ld	l, (iy + TCP_DST0)
+call	printdec2
+call	printcrlf
+
+call	printstringimm
+defb	"TCP: seq num: &", 0
+ld	h, (iy + TCP_SEQ3)
+ld	l, (iy + TCP_SEQ2)
+call	printhex2
+ld	h, (iy + TCP_SEQ1)
+ld	l, (iy + TCP_SEQ0)
+call	printhex2crlf
+
+bit	TCP_ACK_BIT, (iy + TCP_FLG)
+jr	z, tcp_shownoack
+call	printstringimm
+defb	"TCP: ack num: &", 0
+ld	h, (iy + TCP_ACK3)
+ld	l, (iy + TCP_ACK2)
+call	printhex2
+ld	h, (iy + TCP_ACK1)
+ld	l, (iy + TCP_ACK0)
+call	printhex2
+jr	tcp_showedack
+.tcp_shownoack
+call	printstringimm
+defb	"TCP: no ack num", 0
+.tcp_showedack
+call	printcrlf
+
+bit	TCP_PSH_BIT, (iy + TCP_FLG)
+jr	z, tcp_shownopsh
+call	printstringimm
+defb	"TCP: PSH", CR, LF, 0
+.tcp_shownopsh
+
+bit	TCP_RST_BIT, (iy + TCP_FLG)
+jr	z, tcp_shownorst
+call	printstringimm
+defb	"TCP: RST", CR, LF, 0
+.tcp_shownorst
+
+bit	TCP_SYN_BIT, (iy + TCP_FLG)
+jr	z, tcp_shownosyn
+call	printstringimm
+defb	"TCP: SYN", CR, LF, 0
+.tcp_shownosyn
+
+bit	TCP_FIN_BIT, (iy + TCP_FLG)
+jr	z, tcp_shownofin
+call	printstringimm
+defb	"TCP: FIN", CR, LF, 0
+.tcp_shownofin
+
+call	printstringimm
+defb	"TCP: window size: &", 0
+ld	h, (iy + TCP_WIN1)
+ld	l, (iy + TCP_WIN0)
+call	printhex2crlf
+
+bit	TCP_URG_BIT, (iy + TCP_FLG)
+jr	z, tcp_shownourg
+call	printstringimm
+defb	"TCP: urg ptr: &", 0
+ld	h, (iy + TCP_URG1)
+ld	l, (iy + TCP_URG0)
+call	printhex2
+jr	tcp_showedurg
+.tcp_shownourg
+call	printstringimm
+defb	"TCP: no urg ptr", 0
+.tcp_showedurg
+call	printcrlf
+
+ld	a, (iy + TCP_HSZ)
+and	&f0
+rrca
+rrca
+sub	TCP_HDRSIZE
+jr	z, tcp_shownooptions
+call	printstringimm
+defb	"TCP: options size: &", 0
+call	printhex
+call	printcrlf
+.tcp_shownooptions
+
+pop	hl
+
+ret
+
+endif

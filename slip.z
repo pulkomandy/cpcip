@@ -1,0 +1,225 @@
+; CPC/IP SLIP layer
+; Copyright (c) 1999-2000 Mark RISON
+
+
+; See RFC1055
+
+
+SLIP_END	equ	&c0
+SLIP_ESC	equ	&db
+SLIP_ESC_END	equ	&dc
+SLIP_ESC_ESC	equ	&dd
+
+
+.datalink_flags
+
+defb	0
+
+SLIP_OPEN_BIT	equ	7
+SLIP_INESC_BIT	equ	6
+
+
+.datalink_isup			; There's no distinction in SLIP,
+.datalink_isopen		; since there's no establishment phase
+
+bit	SLIP_OPEN_BIT, (hl)
+ret
+
+
+.datalink_up
+
+set	SLIP_OPEN_BIT, (hl)
+call	printcrlfmaybe
+call	printstringimm
+defb	"SLIP: link established", 0
+jp	keyb_displayprompt
+
+
+.datalink_toggle
+
+bit	SLIP_OPEN_BIT, (hl)
+jr	z, datalink_up
+
+res	SLIP_OPEN_BIT, (hl)
+call	printcrlfmaybe
+call	printstringimm
+defb	"SLIP: link terminated", CR, LF, 0
+
+ret
+
+
+.datalink_isempty
+
+ld	hl, (ipbufferinsert)
+ld	de, -ipbuffer - 1
+add	hl, de			; Carry clear iff (ipbufferinsert) at ipbuffer
+ret
+
+
+.datalink_handlechar
+
+bit	SLIP_INESC_BIT, (hl)
+jr	nz, slip_inesc
+
+cp	SLIP_END
+jr	z, slip_eop
+cp	SLIP_ESC
+jr	z, slip_intoesc
+
+.slip_wasslipesc
+
+ld	hl, (ipbufferinsert)
+ld	(hl), a
+inc	hl
+bit	2, h
+ret	nz
+ld	(ipbufferinsert), hl
+ret
+
+.slip_inesc
+
+res	SLIP_INESC_BIT, (hl)
+cp	SLIP_ESC_ESC
+jr	nz, slip_notslipescesc
+ld	a, SLIP_ESC
+
+.slip_notslipescesc
+
+cp	SLIP_ESC_END		; Anything other than SLIP_ESC_ESC and _END
+jr	nz, slip_wasslipesc	; is left untouched, as per RFC1055
+ld	a, SLIP_END
+jr	slip_wasslipesc
+
+.slip_intoesc
+
+set	SLIP_INESC_BIT, (hl)
+ret
+
+
+.slip_eop
+
+; It's looking good!
+
+if	SHOW_RAW_IN
+
+ld	hl, (ipbufferinsert)
+ld	de, ipbuffer
+or	a
+sbc	hl, de
+ret	z			; Always quietly dump zero-len
+
+call	printstringimm
+defb	CR, LF, "[ ", 0
+
+.slip_printdatagram
+
+ld	a, (de)
+call	printhex
+call	printstringimm
+defb	' ', 0
+inc	de
+dec	hl
+ld	a, h
+or	l
+jr	nz, slip_printdatagram
+
+call	printstringimm
+defb	"]", CR, LF, 0
+
+endif
+
+call	ip_handle
+
+.datalink_sop
+
+ld	hl, ipbuffer
+ld	(ipbufferinsert), hl
+
+ret
+
+
+.datalink_sendpacket
+.slip_sendpacket
+
+; Send packet of size BC with base IX
+; AF, BC, HL corrupted
+
+if	DROP_OUT
+ld	a, (slip_send_drop)
+add	a, 256 / DROP_OUT
+ld	(slip_send_drop), a
+ret	c
+endif
+
+; Check for loopback
+
+push	ix
+pop	hl
+
+if	LOOPBACK
+
+ld	a, (ix + IP_DST3)
+cp	LOOPBACK_ADDR
+jp	z, loopback_insert
+
+endif
+
+ld	a, SLIP_END
+call	serial_putchar
+
+if	SHOW_RAW_OUT
+call	printstringimm
+defb	'{', 0
+endif
+
+.slip_sendpacket_more
+
+ld	a, (hl)
+
+if	SHOW_RAW_OUT
+call	printstringimm
+defb	' ', 0
+call	printhex
+endif
+
+cp	SLIP_END
+jr	nz, slip_sendpacket_notend
+ld	a, SLIP_ESC
+call	serial_putchar
+ld	a, SLIP_ESC_END
+
+.slip_sendpacket_notend
+
+cp	SLIP_ESC
+jr	nz, slip_sendpacket_notesc
+ld	a, SLIP_ESC
+call	serial_putchar
+ld	a, SLIP_ESC_ESC
+
+.slip_sendpacket_notesc
+
+call	serial_putchar
+inc	hl
+dec	bc
+ld	a, b
+or	c
+jr	nz, slip_sendpacket_more
+
+ld	a, SLIP_END
+call	serial_putchar
+
+if	SHOW_RAW_OUT
+call	printstringimm
+defb	" }", CR, LF, 0
+endif
+
+ret
+
+
+if	DROP_OUT
+
+.slip_send_drop
+
+defb	0
+
+endif

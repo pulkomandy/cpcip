@@ -1,0 +1,586 @@
+; CPC/IP utility library
+; Copyright (c) 1999-2000 Mark RISON
+
+
+.util_readdec
+
+; Read a decimal in the range 0-255
+;
+; On entry:
+;	HL -> decimal
+;
+; On exit:
+;	A = value read
+;	HL -> first byte after value read
+;	F corrupt
+;
+; Note if HL doesn't point to a number it will be unchanged
+; and A will contain 0.
+
+push	bc
+xor	a
+push	af			; Stack holds best value so far
+
+.util_readdec_loop
+
+ld	c, a
+ld	a, (hl)
+call	isdigit
+jr	c, util_readdec_done
+sub	'0'
+ld	b, a			; B contains next digit to shift in
+
+ld	a, c			; Multiply old A (Ao) by 10, add B
+				; and abort if carry
+add	a, a			; A = 2 * Ao
+jr	c, util_readdec_done
+add	a, a			; A = 4 * Ao
+jr	c, util_readdec_done
+add	a, c			; A = 5 * Ao
+jr	c, util_readdec_done
+add	a, a			; A = 10 * Ao
+jr	c, util_readdec_done
+add	a, b			; A = 10 * Ao + B
+jr	c, util_readdec_done
+
+inc	hl
+pop	bc			; Unstack Ao
+push	af			; and stack A
+jr	util_readdec_loop
+
+.util_readdec_done
+
+pop	af
+pop	bc
+
+ret
+
+
+.util_readdec2
+
+; Read a decimal in the range 0-65535
+;
+; On entry:
+;	DE -> decimal
+;
+; On exit:
+;	HL = value read
+;	DE -> first byte after value read
+;	AF corrupt
+;
+; Note if DE doesn't point to a number it will be unchanged
+; and HL will contain 0.
+
+push	bc
+ld	hl, 0
+push	hl			; Stack holds best value so far
+
+.util_readdec2_loop
+
+ld	a, (de)
+call	isdigit
+jr	c, util_readdec2_done
+sub	'0'			; A contains next digit to shift in
+
+ld	b, h			; Multiply old HL (HLo) by 10, add A
+ld	c, l			; and abort if carry
+add	hl, hl			; HL = 2 * HLo
+jr	c, util_readdec2_done
+add	hl, hl			; HL = 4 * HLo
+jr	c, util_readdec2_done
+add	hl, bc			; HL = 5 * HLo
+jr	c, util_readdec2_done
+add	hl, hl			; HL = 10 * HLo
+jr	c, util_readdec2_done
+ld	b, 0
+ld	c, a
+add	hl, bc			; HL = 10 * HLo + A
+jr	c, util_readdec2_done
+
+inc	de
+pop	bc			; Unstack HLo
+push	hl			; and stack HL
+jr	util_readdec2_loop
+
+.util_readdec2_done
+
+pop	hl
+pop	bc
+
+ret
+
+
+.util_readdottedquad
+
+; Read dotted quad
+;
+; On entry:
+;	HL -> dotted quad
+;	DE -> IP address buffer
+;
+; On exit:
+;	Z clear if format error (HL points at error char)
+;	Z set if all OK (HL points at first char after dotted quad)
+;	AF, DE corrupted
+
+call	util_readdec
+ld	(de), a
+ld	a, (hl)
+cp	'.'
+ret	nz
+
+inc	hl
+inc	de
+call	util_readdec
+ld	(de), a
+ld	a, (hl)
+cp	'.'
+ret	nz
+
+inc	hl
+inc	de
+call	util_readdec
+ld	(de), a
+ld	a, (hl)
+cp	'.'
+ret	nz
+
+inc	hl
+inc	de
+call	util_readdec
+ld	(de), a
+xor	a
+
+ret
+
+
+.writedec
+
+; HL += sprintf (HL, "%u", A) -- without trailing NUL
+; All other regs preserved
+
+push	af
+push	bc
+push	de
+push	ix
+
+ld	ix, writedec_pow10
+ld	b, 3
+ld	c, 0
+
+.writedec_nextdigit
+
+ld	e, (ix + 0)
+inc	ix
+ld	d, 0
+
+.writedec_divide
+
+inc	d
+sub	e
+jr	nc, writedec_divide
+add	a, e
+
+dec	d
+jr	nz, writedec_not0
+
+bit	0, c
+jr	z, writedec_skipleading0
+
+.writedec_not0
+
+ld	e, a
+ld	a, d
+add	a, '0'
+ld	(hl), a
+inc	hl
+set	0, c
+ld	a, e
+
+.writedec_skipleading0
+
+djnz	writedec_nextdigit
+
+bit	0, c
+jr	nz, writedec_notall0
+
+ld	(hl), '0'
+inc	hl
+
+.writedec_notall0
+
+pop	ix
+pop	de
+pop	bc
+pop	af
+
+ret
+
+.writedec_pow10
+
+defb	100, 10, 1
+
+
+.util_skipspace
+
+; Increment HL until it doesn't point to ' '
+; All other regs preserved
+
+push	af
+ld	a, ' '
+
+.util_skipspace_loop
+
+cp	(hl)
+inc	hl
+jr	z, util_skipspace_loop
+
+dec	hl
+pop	af
+
+ret
+
+
+.util_skiptospace
+
+; Increment HL until it points to ' ' or NUL
+; All other regs preserved
+
+push	af
+
+.util_skiptospace_loop
+
+ld	a, (hl)
+inc	hl
+or	a			; NUL
+jr	z, util_skiptospace_done
+cp	' '
+jr	nz, util_skiptospace_loop
+
+.util_skiptospace_done
+
+dec	hl
+pop	af
+
+ret
+
+
+.util_skiphostname
+
+; Increment HL until it doesn't point to a hostname
+; All other regs preserved
+
+push	af
+
+.util_skiphostname_loop
+
+ld	a, (hl)
+inc	hl
+call	util_isvalidinhostname
+jr	nc, util_skiphostname_loop
+
+dec	hl
+pop	af
+
+ret
+
+
+.util_mul50
+
+; HL = HL * 50
+; All other regs preserved
+;
+; Note this routine will not work (overflow) if HL > 1310.
+
+push	af
+push	bc
+
+ld	b, h
+ld	c, l
+add	hl, hl			; * 2
+add	hl, hl			; * 4
+add	hl, bc			; * 5
+ld	b, h
+ld	c, l
+add	hl, hl			; * 10
+add	hl, hl			; * 20
+add	hl, bc			; * 25
+add	hl, hl			; * 50
+
+pop	bc
+pop	af
+
+ret
+
+
+.util_div3
+
+; HL = HL / 3
+; All other regs preserved
+;
+; Note there is a downward bias, but the answer is never an over-estimate.
+; Note this routine will not work (overflow) if HL >= 0xc000.
+
+push	af
+push	bc
+
+inc	hl		; Improves the properties a bit
+ld	b, h
+ld	c, l
+ld	a, 7
+
+.util_div3_loop
+
+srl	b		; 1/3 ~= 1.01010101010101b >> 2
+rr	c
+srl	b
+rr	c
+add	hl, bc
+dec	a
+jr	nz, util_div3_loop
+
+srl	h
+rr	l
+srl	h
+rr	l
+
+pop	bc
+pop	af
+
+ret
+
+
+.util_parsechar
+
+; Parse input character from text stream,
+; handling CR, CRLF, CRNUL and LF as NL
+;
+; On entry:
+;	A = character
+;	C = from previous call (initialise to 0)
+;
+; On exit:
+;	Carry set if character should be discarded
+;	A = character (may be NL) if carry clear
+;	C = to next call
+;	Other flags corrupted
+;
+; Note this routine should not be used where CR, LF and NL need
+; to be distinguished (e.g. telnet).
+
+NL		equ	10
+UTIL_PWCR	equ	4
+
+bit	UTIL_PWCR, c
+jr	nz, util_parsechar_prevwasCR
+
+; Previous character was not CR,
+; so return CR or LF as NL, and anything else unchanged
+
+cp	LF
+jr	z, util_parsechar_returnNL	; C clear
+set	UTIL_PWCR, c
+cp	CR
+jr	z, util_parsechar_returnNL	; C clear
+res	UTIL_PWCR, c
+or	a				; C clear
+ret
+
+.util_parsechar_returnNL
+
+ld	a, NL
+ret
+
+.util_parsechar_returnSKIP
+
+scf					; C set
+ret
+
+; Previous character was CR,
+; so discard LF and NUL, return CR as NL, and anything else unchanged
+
+.util_parsechar_prevwasCR
+
+cp	CR				; C clear
+jr	z, util_parsechar_returnNL
+res	UTIL_PWCR, c
+or	a				; NUL
+jr	z, util_parsechar_returnSKIP
+cp	LF
+jr	z, util_parsechar_returnSKIP
+or	a				; C clear
+ret
+
+
+.util_isvalidinhostname
+
+; C = !isvalidinhostname (A)
+; Other flags corrupted
+
+cp	'.'
+ret	z
+cp	'-'
+ret	z
+cp	'0'
+ret	c
+cp	'9' + 1
+ccf
+ret	nc
+cp	'A'
+ret	c
+cp	'Z' + 1
+ccf
+ret	nc
+cp	'a'
+ret	c
+cp	'z' + 1
+ccf
+
+ret
+
+
+.callhl
+
+; Note use as call callhl.
+
+jp	(hl)
+
+
+.callix
+
+; Note use as call callix.
+
+jp	(ix)
+
+
+.strlen
+
+; A = max (strlen (HL), 255)
+; F corrupted
+; All other regs preserved
+
+push	bc
+push	hl
+
+ld	bc, 256
+xor	a
+cpir
+ld	a, c
+cpl
+
+pop	hl
+pop	bc
+
+ret
+
+
+.strend
+
+; HL = HL + strlen (HL) + 1
+; All other regs preserved
+
+push	af
+
+.strend_loop
+
+ld	a, (hl)
+inc	hl
+or	a
+jr	nz, strend_loop
+
+pop	af
+
+ret
+
+
+.memcmp
+
+; A = memcmp (DE, HL, B)
+; Z set if A == 0; HL, DE point after matched octets
+; Z clear if A != 0; HL, DE point at differing octet
+; B and other flags corrupted
+;
+; Note B == 0 means compare 256.
+
+.memcmp_loop
+
+ld	a, (de)
+sub	(hl)
+ret	nz
+
+inc	de
+inc	hl
+djnz	memcmp_loop
+
+ret
+
+
+.memicmp
+
+; A = memicmp (HL, DE, B) -- ignores case
+; The characters at DE must be in lower case
+; Z set if A == 0; HL, DE point after matched octets
+; Z clear if A != 0; HL, DE point at differing octet
+; B and other flags corrupted
+;
+; Note B == 0 means compare 256.
+
+.memicmp_loop
+
+ex	de, hl
+ld	a, (de)
+call	tolower
+sub	(hl)
+ex	de, hl
+ret	nz
+
+inc	de
+inc	hl
+djnz	memicmp_loop
+
+ret
+
+
+.isdigit
+
+; C = !isdigit (A)
+; Other flags corrupted
+
+cp	'0'
+ret	c
+
+cp	'9' + 1
+ccf
+
+ret
+
+
+.tolower
+
+; A = tolower (A)
+; F corrupted
+;
+; Note only lower-cases ASCII letters.
+; COULD try to extend for ISO 8859
+
+cp	'A'
+ret	c
+
+cp	'Z' + 1
+ret	nc
+
+or	&20
+
+ret
+
+
+.cphlde
+
+; cp hl, de
+
+push	hl
+or	a
+sbc	hl, de
+pop	hl
+
+ret

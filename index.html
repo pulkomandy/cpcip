@@ -1,0 +1,900 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<!-- http://www.nenie.org/cpcip/ -->
+
+<HTML>
+
+<HEAD>
+<TITLE>
+CPC/IP - A TCP/IP stack for Amstrad CPCs
+</TITLE>
+</HEAD>
+
+<BODY>
+
+<H1>
+CPC/IP - A TCP/IP stack for Amstrad CPCs
+</H1>
+
+<P>
+CPC/IP is an implementation of the
+PPP, SLIP, IP, ICMP, UDP, TCP, DNS, TFTP, HTTP, ping, finger and telnet
+protocols for
+<A HREF="http://www.multimania.com/genesis8/faq/amstrad.txt">Amstrad CPC</A>
+computers with an Amstrad, Pace or
+CPC Amstrad International serial interface.
+The code occupies <A HREF="memmap.txt">about 14K</A>,
+excluding the serial, filing system and IP buffers,
+but including all the clients and servers and their buffers/data.
+</P>
+
+<H2>
+What's new?
+</H2>
+
+<UL>
+<LI>
+2001-06-03 (<A HREF="#sourcezip">CPC/IP v0.20</A>)
+<BR>
+CPC/IP makes a comeback!  The <A HREF="tcp.txt">TCP layer</A> has
+been radically overhauled to present a proper API, have a proper
+state machine, and a retransmission timeout.  The <A HREF="ppp.txt">
+PPP</A> layer has a workaround for buggy PPP implementations.
+The <A HREF="telnet.txt">telnet client</A> now supports a line mode,
+including echo suppression; it's quite feasible to
+<A HREF="telprot.html">use this to send/receive email/news</A>.
+The <A HREF="serialdd.txt">serial device driver</A> now supports
+the CPC Amstrad International serial interface.
+</LI>
+<LI>
+2000-10-15 (CPC/IP v0.12)
+<BR>
+Improve portability by introducing a
+<A HREF="stdio.txt">standard I/O API</A>
+(use this in the <A HREF="httpd.txt">HTTP server</A>
+(fixes problem with serving binary files);
+note the <A HREF="tftpd.txt">TFTP server</A>
+has not been updated yet).
+Extend the <A HREF="serialdd.txt">Amstrad serial interface device driver</A>
+to support polling, parity, more stop bits and not using hardware flow control
+(no hardware flow control is now the default for the executable).
+Extend the <A HREF="config.txt">configuration</A> to allow
+finer control over the components included in the build.
+Add <A HREF="#port">some hints on starting a port</A>.
+Tweak head in <A HREF="cpcsutils.html">cpcsutils</A>
+to support files bigger than 64K.
+</LI>
+<LI>
+2000-07-02
+<BR>
+Update the <A HREF="#zmac">Z80 assembler</A>.
+</LI>
+<LI>
+2000-03-12 (CPC/IP v0.11)
+<BR>
+Improve <A HREF="ppp.txt">PPP layer</A>: make more robust against
+remote rejection, add requesting of DNS server address to use, and
+add peer PPP tickle (use Copy to send this, immediately after the
+physical link has been established).
+Update the <A HREF="#zmac">Z80 assembler</A>.
+</LI>
+<LI>
+2000-02-29
+<BR>
+I wanted to release something on this cool date, but
+unfortunately I was ill.  Oh, well...
+</LI>
+<LI>
+2000-01-23 (CPC/IP v0.10)
+<BR>
+Add support for <A HREF="ppp.txt">PPP</A> (but <A HREF="slip.txt">SLIP</A>
+remains the default for the executable for now).
+Add support for 64K machines
+(this is now the default for the executable) in
+the <A HREF="serialdd.txt">Amstrad serial interface device driver</A>
+and <A HREF="loopback.txt">loopback driver</A>.
+The <A HREF="telnet.txt">telnet</A> client now reports when
+the connection has been established (incidentally, you can
+now enter a bare CR (i.e. not a CRLF) using Enter).
+Note you'll need to recompile <A HREF="#zmac">ZMAC 1.1.1.2</A>
+with MAXIFS on line 55
+#defined to 1024, say, if you want to use that to assemble CPC/IP;
+I haven't tried assembling CPC/IP with Maxam for quite
+a while now!
+Also, the config stuff has moved one byte up (in case you're
+using a loader to set things like your address and DNS server,
+or DNS zone, or hosts.txt) and all the config stuff which used
+to be in <A HREF="main.txt">main.z</A>
+is now in <A HREF="config.txt">config.z</A>.
+</LI>
+<LI>
+2000-01-01 (CPC/IP v0.09)
+<BR>
+Nothing to report.  It's not even clear CPC/IP v0.09 ever existed.
+Ask <A HREF="http://www.arm.com/">ARM</A> about the ARM4 and ARM5
+for more details.
+</LI>
+<LI>
+1999-12-19 (CPC/IP v0.08)
+<BR>
+Add <A HREF="resolv.txt">resolver</A> and
+<A HREF="host.txt">nameserver lookup client</A>;
+default nameserver is 127.0.0.1 (localhost).
+Speed up <A HREF="telnet.txt">telnet</A>
+<A HREF="cons.txt">console</A> output.
+Add nameserver address and domain name to
+<A HREF="config.txt">configuration</A>; the nameserver address
+can be set with the <A HREF="ifconfig.txt">ifconfig module</A>.
+A few miscellaneous little bug fixes.
+</LI>
+<LI>
+1999-11-28 (CPC/IP v0.07, the birthday release!)
+<BR>
+Release <A HREF="httpd.txt">tipi, the HTTP/0.9 server</A>.
+Improve the <A HREF="tcp.txt">TCP layer</A>, so it's at least plausible.
+Improve <A HREF="telnet.txt">telnet</A>, in particular so it can function
+as a <A HREF="cons.txt">console</A>
+(with <A HREF="cpc.tmi">a suitable terminfo</A>).
+There's a <A HREF="hosts.txt">hosts.txt-like mechanism</A>,
+which the clients now use.
+Add <A HREF="cpcaisio.txt">driver for the CPC Amstrad International serial
+interface</A>, courtesy of Tim RIEMANN.
+Note the code is now loaded at &amp;3800 with HIMEM at &amp;27ff,
+CPC/IP's <A HREF="config.txt">default IP address</A> is now 192.168.6.128,
+Ctrl-[ should be used to abort a telnet connection,
+and Ctrl-Esc should be used to quit CPC/IP -- or use the new quit command.
+</LI>
+<LI>
+1999-10-03
+<BR>
+Update the <A HREF="#zmac">Z80 assembler</A>.
+</LI>
+<LI>
+1999-09-09 (CPC/IP v0.06)
+<BR>
+<A HREF="ping.txt">ping</A> and (basic) <A HREF="telnet.txt">telnet</A>
+clients added.  <A HREF="loopback.txt">Loopback</A> support added.
+<A HREF="tcp.txt">TCP</A> layer still exceedingly rudimentary!
+<A HREF="icmp.txt">ICMP</A> checksums now fully supported.
+The <A HREF="#cli">command-line interface</A> has been extended
+to support multiple clients.
+</LI>
+<LI>
+1999-08-08
+<BR>
+Release a <A HREF="#scrfast">mode 2 text accelerator</A>.
+Tweak the set-up details a bit more.
+</LI>
+<LI>
+1999-07-18
+<BR>
+Release a <A HREF="#zmac">Z80 assembler</A>.
+Improve this document (add more links and more set-up details).
+</LI>
+<LI>
+1999-07-04
+<BR>
+Fix bug in <A HREF="#scrsave">the screen saver</A>:
+it wouldn't work with a 464 with a disc interface.
+</LI>
+<LI>
+1999-06-27 (CPC/IP v0.05)
+<BR>
+Release <A HREF="dnsd.txt">DNS server</A>.
+</LI>
+<LI>
+1999-06-20
+<BR>
+Release <A HREF="#scrsave">CPC screen saver</A>
+and <A HREF="#zdis">Z80 symbolic disassembler</A>.
+</LI>
+<LI>
+1999-06-06 (CPC/IP v0.04)
+<BR>
+Forgot head.c in <A HREF="cpcsutils.html">cpcsutils</A>!
+Minor tab-handling bug fixed.
+This file added (as documentation) to
+<A HREF="#sourcezip">the zipped sources</A>.
+<A HREF="serialdd.txt">Serial device driver</A> optimised.
+</LI>
+<LI>
+1999-05-31 (CPC/IP v0.03)
+<BR>
+Very rudimentary <A HREF="tcp.txt">TCP layer</A> implemented;
+enough for a <A HREF="finger.txt">finger client</A>.
+<A HREF="tftpd.txt">TFTP server</A> now handles AMSDOS errors
+and reports them remotely.
+Miscellaneous improvements and bug fixes.
+A bunch of |BLOW and |SUCK utilities,
+<A HREF="cpcsutils.html">cpcsutils</A>, and documents on
+<A HREF="amsdosbugs.txt">AMSDOS</A> and
+<A HREF="amssiobugs.txt">Amstrad serial interface</A> features.
+</LI>
+<LI>
+1999-05-03 (CPC/IP v0.02)
+<BR>
+<A HREF="udp.txt">UDP layer</A> and
+<A HREF="tftpd.txt">TFTP server</A> (writes only) implemented.
+Source exploded into multiple files, and made more modular and documented.
+A couple of bug fixes.  
+This document updated and expanded a bit.
+</LI>
+<LI>
+1999-04-18 (CPC/IP v0.01)
+<BR>
+It's all new.
+</LI>
+</UL>
+
+<H2>
+Compatibility
+</H2>
+
+<P>
+CPC/IP is compatible with the following Internet protocols,
+with the limitations listed further below:
+</P>
+
+<UL>
+<LI>
+PPP (<A HREF="http://www.ietf.org/rfc/rfc1661.txt">RFC1661</A>,
+<A HREF="http://www.ietf.org/rfc/rfc1662.txt">RFC1662</A>),
+IPCP (<A HREF="http://www.ietf.org/rfc/rfc1332.txt">RFC1332</A>,
+<A HREF="http://www.ietf.org/rfc/rfc1877.txt">RFC1877</A>),
+PAP (<A HREF="http://www.ietf.org/rfc/rfc1334.txt">RFC1334</A>).
+</LI>
+<LI>
+SLIP (<A HREF="http://www.ietf.org/rfc/rfc1055.txt">RFC1055</A>).
+</LI>
+<LI>
+IPv4 (<A HREF="http://www.ietf.org/rfc/rfc0791.txt">RFC791</A>).
+</LI>
+<LI>
+ICMP (<A HREF="http://www.ietf.org/rfc/rfc0792.txt">RFC792</A>).
+</LI>
+<LI>
+UDP (<A HREF="http://www.ietf.org/rfc/rfc0768.txt">RFC768</A>).
+</LI>
+<LI>
+TCP (<A HREF="http://www.ietf.org/rfc/rfc0793.txt">RFC793</A>).
+</LI>
+<LI>
+DNS (<A HREF="http://www.ietf.org/rfc/rfc1034.txt">RFC1034</A>, 
+<A HREF="http://www.ietf.org/rfc/rfc1035.txt">RFC1035</A>), client
+and server.
+</LI>
+<LI>
+TFTP (<A HREF="http://www.ietf.org/rfc/rfc1350.txt">RFC1350</A>), server.
+</LI>
+<LI>
+HTTP/0.9 (<A HREF="http://www.ietf.org/rfc/rfc2068.txt">RFC2068</A>
+for HTTP/1.1), server.
+</LI>
+<LI>
+ping (<A HREF="http://www.ietf.org/rfc/rfc2151.txt">RFC2151</A>), client.
+</LI>
+<LI>
+finger (<A HREF="http://www.ietf.org/rfc/rfc1288.txt">RFC1288</A>), client.
+</LI>
+<LI>
+telnet (<A HREF="http://www.ietf.org/rfc/rfc0854.txt">RFC854</A>,
+<A HREF="http://www.ietf.org/rfc/rfc0857.txt">RFC857</A>,
+<A HREF="http://www.ietf.org/rfc/rfc0858.txt">RFC858</A>), client.
+</LI>
+</UL>
+
+<H2>
+Unsupported features
+</H2>
+
+<P>
+Some of these limitations make this implementation non-compliant as per
+<A HREF="http://www.ietf.org/rfc/rfc1122.txt">RFC1122</A> and
+<A HREF="http://www.ietf.org/rfc/rfc1123.txt">RFC1123</A>.
+You'll have to decide for yourself how significant the non-compliances are!
+</P>
+
+<UL>
+<LI>
+The TCP layer <A HREF="tcpbugs.html">isn't perfect</A>.
+</LI>
+<LI>
+IP fragmentation (the MTU is over 1020 octets, though).
+</LI>
+<LI>
+All the IP option fields.  They are ignored.
+</LI>
+<LI>
+Handling all the ICMP messages except for ECHO.
+</LI>
+<LI>
+TFTP RRQ (so files can't be fetched from CPC/IP).
+</LI>
+<LI>
+Recursive DNS queries (hey, they're not mandatory!).
+DNS on TCP (so zone transfers don't work).
+</LI>
+<LI>
+telnet commands, apart from the option commands,
+and telnet options, apart from echo and suppress-go-ahead.
+</LI>
+<LI>
+The resolver might give the wrong address
+for a hostname (this would occur if a nameserver gave an A RR for
+something like another nameserver before it gave the address for
+the given hostname)!
+</LI>
+</UL>
+
+<P>
+Oh, and
+<A HREF="http://www.ntk.net/index.cgi?back=archive00/now0128.txt&amp;line=110#l">
+CPC/IP doesn't support streaming RealVideo</A>.
+</P>
+
+<H2>
+Portability
+</H2>
+
+<P>
+Although CPC/IP officially only supports Amstrad CPCs
+with Amstrad serial interfaces, it should work on compatible
+systems.  The important points are that
+</P>
+
+<UL>
+<LI>
+The serial chip must be Z80-DART-compatible, and be located
+at &amp;fadc/fadd.  The chip's interrupt line must be connected.
+</LI>
+<LI>
+The clock generator must be CTC-8253-compatible
+and be located at &amp;fbdc/fbdd/fbdf.  It must be clocked
+at 2&nbsp;MHz.
+</LI>
+</UL>
+
+<P>
+Note the Pace serial interface satisfies these requirements,
+except that the interrupt line is not connected.  It
+must therefore be polled.  In turn, this means the datarate
+should be 4800 bps (though 9600 bps may be achievable if
+8E2 or maybe just 8N2 framing is used -- it is in fact only
+necessary to use two stop bits on the remote side, so you
+might be able to get away with 8N1 on the CPC).  You will need to
+make appropriate changes in <A HREF="config.txt">config.z</A>
+and rebuild.
+</P>
+
+<P>
+The serial interface which appeared in CPC Amstrad International
+1992-06/07 is also believed to be supported (untested);
+you'll need to make appropriate changes in
+<A HREF="config.txt">config.z</A> and rebuild to use this.
+</P>
+
+<P>
+If you want to use the full 128K, then if your machine isn't
+a CPC6128 the important point is that
+</P>
+
+<UL>
+<LI>
+The 128K must be selectable using OUT (&amp;7fxx), &amp;cx.  
+32K is used for rx/tx buffers and 16K is used for a loopback buffer;
+the rest may be used in the future to
+hide most of the code out of the main 64K.
+</LI>
+</UL>
+
+<P>
+Failing all this, though, it shouldn't be very difficult to port the
+system-dependent bits to a different system.
+</P>
+
+<H2>
+How to use
+</H2>
+
+<P>
+(The following assumes connection to a Linux box, and specifically
+to the version of Linux which happens to be on my box at home.
+I'm not a Linux guru, so it's unlikely I'll be able to help if
+the Linux bits don't work for you or make no sense!
+You can also connect straight
+to an ISP via a modem (ignoring all the bits about setting up the peer),
+as long as, if you're using SLIP, you use <KBD>ifconfig</KBD> to set your
+IP address everytime if your ISP gives out non-static IP addresses.
+Note: the Amstrad serial interface, at least, won't receive
+unless Carrier Detect is active, if hardware flow control is being used.
+The CPCAI serial interface won't ever receive if Carrier Detect is
+inactive, even if hardware flow control isn't being used!
+If you can't get your modem to
+force it active via a DIP switch, you'll have to type "AT&amp;C0" blind
+to do so in software.)
+</P>
+
+<UL>
+<LI>
+<A HREF="cpcsutils.html">Somehow</A> get CPC/IP into your CPC.
+Your options are:
+<UL>
+<LI>
+Get <A NAME="sourcezip" HREF="cpcip020.zip">the zipped sources</A>,
+unzip them, transfer them onto a CPC disc,
+edit <A HREF="config.txt">config.z</A> to specify your CPC's IP address
+unless you're happy with the default 192.168.6.128,
+load <A HREF="main.txt">main.z</A> into Maxam
+and assemble it (set HIMEM to &amp;27ff).  The sources consist of
+<!-- Source files referenced as .txt to avoid content-type problems -->
+<A HREF="config.txt"	NAME="config">		config.z</A>,
+<A HREF="main.txt"	NAME="main">		main.z</A>,
+<A HREF="telnet.txt"	NAME="telnet">		telnet.z</A>,
+<A HREF="finger.txt"	NAME="finger">		finger.z</A>,
+<A HREF="host.txt"	NAME="host">		host.z</A>,
+<A HREF="ping.txt"	NAME="ping">		ping.z</A>,
+<A HREF="ifconfig.txt"	NAME="ifconfig">	ifconfig.z</A>,
+<A HREF="httpd.txt"	NAME="httpd">		httpd.z</A>,
+<A HREF="tftpd.txt"	NAME="tftpd">		tftpd.z</A>,
+<A HREF="dnsd.txt"	NAME="dnsd">		dnsd.z</A>,
+<A HREF="resolv.txt"	NAME="resolv">		resolv.z</A>,
+<A HREF="tcp.txt"	NAME="tcp">		tcp.z</A>,
+<A HREF="udp.txt"	NAME="udp">		udp.z</A>,
+<A HREF="ip.txt"	NAME="ip">		ip.z</A>,
+<A HREF="icmp.txt"	NAME="icmp">		icmp.z</A>,
+<A HREF="slip.txt"	NAME="slip">		slip.z</A>,
+<A HREF="ppp.txt"	NAME="ppp">		ppp.z</A>,
+<A HREF="fcstab16.txt"	NAME="fcstab16">	fcstab16.z</A>,
+<A HREF="loopback.txt"	NAME="loopback">	loopback.z</A>,
+<A HREF="cs.txt"	NAME="cs">		cs.z</A>,
+<A HREF="stdio.txt"	NAME="stdio">		stdio.z</A>,
+<A HREF="serialdd.txt"	NAME="serialdd">	serialdd.z</A>,
+<A HREF="hosts.txt"	NAME="hosts">		hosts.z</A>,
+<A HREF="cons.txt"	NAME="cons">		cons.z</A>,
+<A HREF="printlib.txt"	NAME="printlib">	printlib.z</A>,
+<A HREF="utillib.txt"	NAME="utillib">		utillib.z</A>,
+<A HREF="linklist.txt"	NAME="linklist">	linklist.z</A>, and
+<A HREF="timeout.txt"	NAME="timeout">		timeout.z</A>.
+</LI>
+<LI>
+Get <A HREF="cpcip020.bin">the executable</A>,
+change the third to sixth bytes to specify your CPC's IP address
+(or remember to set this at run-time as described below) unless
+you're happy with the default 192.168.6.128,
+<A HREF="cpcsutils.html">transfer the file into your CPC</A>,
+and load it to &amp;3800 (set HIMEM to &amp;27ff using
+"MEMORY&nbsp;&amp;27ff").
+</LI>
+<LI>
+Assemble it all using <A HREF="#zmac">ZMAC</A> and proceed as
+above with the executable.
+</LI>
+</UL>
+<LI>
+Remember, if you're trying to transfer a binary file to a CPC it
+must end up with an AMSDOS header.
+Put an AMSDOS header on using something like
+"head&nbsp;main.bin&nbsp;-l3800&nbsp;-fcpcip.bin&nbsp;>cpcip.bin"
+(see <A HREF="cpcsutils.html">cpcsutils</A> for head).
+You can then transfer the file using
+"A$&nbsp;=&nbsp;"cpcip.bin"&nbsp;:&nbsp;|SUCK,&nbsp;@a$"
+on the CPC and "blow&nbsp;cpcip.bin" (from the same package) on the source box,
+or tftp (remember to use binary mode!) if you've already managed to get
+just about any version of CPC/IP on your Amstrad CPC.
+</LI>
+<LI>
+Set up the serial port on the peer.  You'll need to:
+<UL>
+<LI>
+Set the serial port to use 8&nbsp;data bits, no parity, and 1&nbsp;stop bit.
+I think this is normally the default, which is a good thing because
+I don't know where or how to change it (though I suspect suitable stty
+lines somewhere in /etc/rc.boot/0setserial might do the trick)!
+</LI>
+<LI>
+Edit /etc/inittab to allow connection via this serial port,
+at 9600&nbsp;bps (or 2400&nbsp;bps if using the CPC Amstrad International
+serial interface) and using hardware flow control, if appropriate.
+This is what I've got:
+<BR>
+T1:23:respawn:/sbin/getty -L -h ttyS1 9600
+</LI>
+<LI>
+Use /sbin/init&nbsp;q to cause this file to be reparsed
+(only necessary the first time).
+</LI>
+</UL>
+</LI>
+<LI>
+Launch CPC/IP!  "CALL&nbsp;&amp;3800".  You should see a login prompt.
+Log in using any account, to check the serial link is working OK.
+Log out.
+</LI>
+<LI>
+Set up SLIP or PPP on the peer.
+If you want to use PPP, you're probably best off
+<A HREF="mailto:mrison@hotmail.com">contacting me</A> for further
+details.  If you want to have a go on your own, be aware that
+(a) the peer needs to support PAP, if it wants to authenticate,
+and you need to enter your PAP details in <A HREF="config.txt">config.z</A>,
+(b) there are no timeouts in the current implementation, so it
+could all just seize up,
+(c) there are no state checks in the current implementation, so it
+could all go haywire,
+(d) I would dare to suggest there's a bug in pppd version 2.3 patch level 5,
+which means you should turn off Van Jacobson compression (using "novj")
+(e) I've put in a workaround for buggy PPP implementations which
+unfortunately means that should the remote side send spurious control
+characters they won't be filtered out,
+(f) the local address and DNS server to use will automatically
+be requested (but can subsequently be overridden using <KBD>ifconfig</KBD>).
+For SLIP you'll need to:
+<UL>
+<LI>
+Create a suitable account using adduser.
+</LI>
+<LI>
+Make this account use /usr/sbin/sliplogin as its shell.
+</LI>
+<LI>
+Suitably edit /etc/slip.hosts (use DYNAMIC as the remote address).
+</LI>
+<LI>
+Suitably edit /etc/slip.tty (to specify your CPC's address).
+</LI>
+<LI>
+Modify /etc/slip.login to make the MTU 1006 (CPC/IP would support 1023
+but this is the Berkeley SLIP limit).
+</LI>
+<LI>
+Make sure /usr/sbin/sliplogin is setuid (use "chmod&nbsp;u+s" if not)
+and the SLIP account has execute permission (fiddle with /etc/group if not).
+</LI>
+<LI>
+Add your CPC to /etc/hosts using the address you allocated (optional).
+</LI>
+</UL>
+Alternatively, you could use slattach and ifconfig (as root), if you
+can work out the parameters (it's not particle physics).  Here
+is a hint:
+<BR>
+slattach -L -p slip -s 9600 /dev/ttyS0 &amp;
+<BR>
+ifconfig sl0 192.168.4.86 pointopoint 192.168.6.128 up mtu 1006
+</LI>
+<LI>
+Go back to your CPC.  Log in using the SLIP account.
+<A NAME="cli">You should now be able to use the stack</A>:
+<UL>
+<LI>
+You should be able to ping your CPC.
+</LI>
+<LI>
+You should be able to transfer files to your CPC using TFTP
+on the remote machine.
+The filename should be AMSDOS-friendly, your disc should have
+enough free space, etc.  Transferring files from your CPC using TFTP isn't
+possible yet, unfortunately.
+</LI>
+<LI>
+You should be able to fetch files from your CPC using tipi,
+the HTTP/0.9 server.
+The URL to use is just what you'd expect; something like
+http://sugar/index.htm .  Note if you're serving non-ASCII
+files, they should have AMSDOS headers;
+head from <A HREF="cpcsutils.html">cpcsutils</A> may be useful!
+</LI>
+<LI>
+You should be able to make DNS queries regarding the
+bufo-house.org domain using rind,
+the Retro Internet Name Daemon.
+Type things like "host&nbsp;-a&nbsp;cpc&nbsp;[CPC]"
+and "host&nbsp;-a&nbsp;bufo-house.org&nbsp;[CPC]", where [CPC] is
+your CPC's IP address, on the remote machine.
+To use your own choice of DNS information, you can rebuild CPC/IP after
+changing <A HREF="dnsd.txt">dnsd.z</A>, or you can load a DNS zone
+file into memory and place the base address at &amp;380d.
+</LI>
+<LI>
+To use any of the clients CPC/IP will have to realise/believe a SLIP
+connection has been established (shown by the presence of a
+command-line prompt ("> ")).  One way to do so is to ping
+your CPC once.  Another is to press Copy.
+</LI>
+<LI>
+In all the clients you can use textual addresses defined
+in <A HREF="hosts.txt">hosts.z</A>.  By default these are
+localhost (127.0.0.1), sugar (192.168.6.128) and
+koaks (192.168.4.86).
+To use your own choice of hosts, you can rebuild CPC/IP after
+changing <A HREF="hosts.txt">hosts.z</A>, or you can load a
+hosts.txt file into memory and place the base address at &amp;3807.
+</LI>
+<LI>
+If you want to change your CPC's address (only important for
+clients and if you didn't suitably set this in the source/executable
+if you don't want to use the default 192.168.6.128)
+you can use <KBD>ifconfig</KBD>.  As for all the clients, you can
+get the syntax by entering the command name on its own.
+Note the clients may be more permissive regarding syntax than
+the syntax help would suggest; you should not rely on any
+short-cuts you find working in future versions of CPC/IP!
+</LI>
+<LI>
+If you want to set the nameserver you can also use <KBD>ifconfig</KBD>.
+The default nameserver is 127.0.0.1 (localhost, your CPC), which
+doesn't serve much!  The nameserver should preferably support
+recursive queries, because the resolver doesn't!
+</LI>
+<LI>
+You should be able to finger other machines from your CPC.
+Remember by default there's no world-wide nameserver,
+so you'll have to type numeric addresses!
+You can use Ctrl-C to abort a connection.
+</LI>
+<LI>
+You should be able to ping other machines from your CPC.
+This is one of the only three things you can ("usefully") do without a
+serial interface: specify a loopback address such as 127.0.0.1.
+Note the numeric parameters in this command should be less
+than 256.
+You can use Ctrl-C to abort pinging.
+</LI>
+<LI>
+You can also make nameserver queries using host; this is the second thing
+you can do without a serial interface.  For a hostname, you can either get
+all the numeric addresses corresponding to it,
+or all DNS information (using -a), or mail
+exchange information (using -m).  You can also do reverse lookups
+on numeric addresses.
+You can use Ctrl-C to abort a lookup.
+</LI>
+<LI>
+You should be able to telnet to other machines from your
+CPC.  You can use Ctrl-[ to abort a connection.
+You can <A HREF="telprot.html">use this to fetch a page locally
+from tipi</A>; this is the third and last thing you can do
+without a serial interface.  If you're connected to the Internet,
+though, <A HREF="telprot.html">then you can use telnet to
+send and receive email and news, and even surf the net</A>!
+Also, install <A HREF="cpc.tmi">this terminfo file</A> using "tic cpc.tmi"
+(as root),
+select it using "export&nbsp;TERM=cpc" or your shell's equivalent,
+and you'll have a fully-functional console.
+The arrow keys work; Ctrl-Left/Right will do Home/End,
+Ctrl-Up/Down will do Page Up/Down, Clr will do Delete/Clear, Esc will
+do Esc, and Ctrl-Tab will do Insert.
+</LI>
+<LI>
+There is a resolver which the clients automatically use if the
+address given isn't numeric and isn't in
+<A HREF="hosts.txt">hosts.txt</A>.  This will
+automatically append the domain name specified in
+<A HREF="config.txt">config.z</A> -- "bufo-house.org"
+by default (rebuild to use yours!) -- to addresses without dots.
+If you need to make
+sure this doesn't happen for any reason, make the address
+absolute by putting a dot at the end.
+DNS is a bit of a monster, and so the resolver may well go
+wrong!  If it does, please <A HREF="mailto:mrison@hotmail.com">tell me</A>,
+specifying the nameserver you were using and the query you were making
+(the address you were trying to resolve).
+</LI>
+<LI>
+Press Ctrl-Esc to escape from CPC/IP.  (If after acquiring a SLIP
+link you find you need to use CPC/IP as a terminal again
+(e.g. because your link fell over), press Copy.)
+</LI>
+</UL>
+</LI>
+</UL>
+
+<P>
+Well, wasn't that worth it?!
+</P>
+
+<H2>
+Other 8-bit TCP/IP stacks
+</H2>
+
+<UL>
+<LI>
+<A HREF="http://www.tazenda.demon.co.uk/phil/acorn.html">A
+BBC stack</A> is available.
+</LI>
+<LI>
+A C64 stack is available as part of 
+<A HREF="http://tipi.choin.net/home/dallmann/lunix/lunix.html">Lunix</A>,
+the mini-Un*x for C64s.
+</LI>
+<LI>
+<A HREF="http://www.jb.man.ac.uk/~djm/z88dk/zsock/">A Z88 stack, ZSock</A>,
+is being developed.
+</LI>
+<LI>
+An MSX stack is being developed as part of
+<A HREF="http://www.dcc.unicamp.br/~adrcunha/uzix/">UZIX</A>,
+the mini-Un*x for MSX computers.
+</LI>
+<LI>
+<A HREF="http://home.columbus.rr.com/ksiders/ice.htm">An
+8-bit Atari stack, ICE</A>, is being developed.
+</LI>
+<LI>
+<A HREF="http://earthling.net.nz/~michaelh/old/misc/os-tcp-0.13.tar.gz">A
+stack aimed at the Gameboy</A> is/was being developed.
+</LI>
+<LI>
+<A HREF="http://oric.ifrance.com/oric/projets.html">An
+Oric stack</A> is being developed.
+</LI>
+<LI>
+<A HREF="http://www.informatik.uni-frankfurt.de/~zapf/TI99/tcpip.html">A
+TI-99/4A stack</A> is being developed.
+</LI>
+<LI>
+<A HREF="http://www.sci.kun.nl/marie/home/joostk/msx/tcpip/index.html">Another
+MSX stack</A> was in development, but the effort appears to have stalled.
+</LI>
+<LI>
+If you know about other 8-bit stacks,
+please <A HREF="mailto:mrison@hotmail.com">tell me</A>!
+</LI>
+</UL>
+
+<H2>
+Tangents
+</H2>
+
+<UL>
+<LI>
+<A HREF="cpcsutils.html">cpcsutils</A> is a set of programs
+to assist in |BLOWing and |SUCKing the Amstrad serial interface.
+</LI>
+<LI>
+I've written <A NAME="scrsave" HREF="scrsave.zip">an
+Amstrad CPC screen saver</A>.  It coexists very nicely
+with CPC/IP: ignore what the readme says and instead
+LOAD"SCRSAVE.BIN",&nbsp;&amp;7f00 and CALL&nbsp;&amp;7f00
+(the blank delay is at &amp;7fde).
+</LI>
+<LI>
+I've put together <A NAME="scrfast" HREF="scrfast.zip">an
+Amstrad CPC mode 2 text accelerator</A>, based on code
+supplied by Richard WILSON.  It too coexists very nicely
+with CPC/IP: ignore what the readme says and instead
+LOAD"SCRFAST.BIN",&nbsp;&amp;7e00 and CALL&nbsp;&amp;7e00.
+</LI>
+<LI>
+<A NAME="zmac" HREF="zmac13.zip">ZMAC</A> is a Z80 assembler and
+<A NAME="zdis" HREF="zdis210.zip">ZDIS</A> is a Z80 symbolic
+disassembler.  
+If you're the sort of person who'd find these
+useful, you should be able to work out how to build and use
+them!
+</LI>
+<LI>
+I've written <A NAME="amssiobugs" HREF="amssiobugs.txt">a document about
+various features of the Amstrad serial interface</A>.
+</LI>
+<LI>
+I've written <A NAME="amsdosbugs" HREF="amsdosbugs.txt">a document about
+various AMSDOS features</A>.
+</LI>
+</UL>
+
+<H2>
+What next?
+</H2>
+
+<P>
+If you like what you see, and would like things to go further,
+then please get in touch.  If no-one cares, there's not much
+point (although it's quite an educational experience implementing
+the protocols).
+</P>
+
+<P>
+As you will see if you look at the code, it's reasonably
+well structured (within the limitations of Maxam), and hooking
+in new stuff shouldn't be too difficult.  The most interesting
+bit will be to work out how to allow things to hook in and then
+be called in the background.  I've been thinking of schemes
+using OS events, but nothing's very firm yet.  Currently the
+serial device driver is interrupt-driven, but the protocol
+stack is essentially polling-driven.
+</P>
+
+<H2>
+Can you contribute?
+</H2>
+
+<UL>
+<LI>
+If you're an Internet guru (or even if you're just keen!)
+and would like to contribute to CPC/IP, please get in touch.
+</LI>
+<LI>
+I don't know very much about the Internet protocols
+(just about all I know comes from reading the RFCs), and I
+could do with advice (for instance, which IP options and
+ICMP messages are, realistically, worth implementing?).
+</LI>
+<LI>
+Perhaps CPC/IP could become PCW/IP or S128/IP?  The most important
+point to consider here is that CPC/IP uses both IX and IY.
+Please <A HREF="mailto:mrison@hotmail.com">email me</A>
+if you're even remotely interested in doing a port.
+<A NAME="port">All you need to get a basic pingable system is to:</A>
+<UL>
+<LI>
+Copy cs.z, icmp.z, ip.z, main.z, slip.z, printlib.z, utillib.z as is.
+</LI>
+<LI>
+Copy config.z, changing values as appropriate (making sure you
+turn off all the bits you can).
+</LI>
+<LI>
+Write serialdd.z.
+</LI>
+<LI>
+Write stdio.z.  You don't need the FILE_* or KL_* routines; the other
+routines need not be perfect.
+</LI>
+</UL>
+</LI>
+<LI>
+Perhaps device drivers could be written for other Amstrad serial
+interfaces (the only file which should need changing is
+<A HREF="serialdd.txt">serialdd.z</A>).
+</LI>
+<LI>
+Perhaps you'd like to write a TFTP client, or an FTP client, 
+or an IRC client, or a WWW browser, or a POP3 client,
+or an SMTP client, or an NNTP client, or an NFS client...
+</LI>
+</UL>
+
+<H2>
+Copyright
+</H2>
+
+<P>
+Although I ultimately plan to make CPC/IP available Free,
+at this stage in its evolution I would like to keep it
+under reasonable control.
+</P>
+
+<P>
+CPC/IP is Copyright (c) 1999-2001 Mark RISON.
+You may not distribute it without my permission (this includes
+modified/extended versions).
+Try <A HREF="mailto:mrison@hotmail.com">emailing me</A>
+for permission -- you should be pleasantly surprised!
+</P>
+
+<P>
+Thank you for respecting this.
+</P>
+
+<HR>
+
+<P>
+Mark RISON,
+&lt;<A HREF="mailto:mrison@hotmail.com">mrison@hotmail.com</A>>,
+2001-06-03
+</P>
+
+<P>
+Thanks to Franck ARNAUD for hosting these pages.
+</P>
+
+<P>
+<A HREF="http://validator.w3.org/check/referer">
+<IMG BORDER="0" SRC="http://www.w3.org/Icons/valid-html32"
+     ALT="Valid HTML 3.2!" height="31" width="88">
+</A>
+</P>
+
+</BODY>
+
+</HTML>

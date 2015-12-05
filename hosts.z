@@ -1,0 +1,98 @@
+; CPC/IP host lookup
+; Copyright (c) 1999-2000 Mark RISON
+
+
+.hosts_lookup
+
+; Look up hostname
+;
+; On entry:
+;	HL -> hostname
+;	DE -> IP address buffer
+;
+; On exit:
+;	Z clear if not found (HL corrupted)
+;	Z set if found (HL points at first char after hostname)
+;	AF, BC, DE corrupted
+;
+; Note hostname should conform to standards, i.e. start with
+; a letter or digit and contain only letters, digits, hyphens or dots
+; (numeric hostnames should contain only digits and dots).
+
+; Try for a numeric hostname first
+
+ld	b, h
+ld	c, l
+
+push	de
+call	util_readdottedquad	; Note does not corrupt BC!
+pop	de
+ret	z			; It was indeed a numeric hostname
+
+ld	h, b
+ld	l, c
+
+push	de
+ex	de, hl
+ld	hl, (config_hosts_txt)
+
+.hosts_trynextmatch
+
+push	de
+
+.hosts_trymatch
+
+ld	a, (de)
+inc	de
+call	util_isvalidinhostname
+jr	nc, hosts_wasvalidinhostname
+xor	a			; If not valid, treat as NUL
+
+.hosts_wasvalidinhostname
+
+call	tolower
+cp	(hl)
+jr	nz, hosts_notthisone
+
+or	(hl)			; Both NUL?
+inc	hl
+jr	nz, hosts_trymatch
+
+pop	bc
+ld	b, d
+ld	c, e
+pop	de
+push	bc
+ld	bc, 4
+ldir
+pop	hl
+dec	hl
+
+xor	a
+
+ret
+
+.hosts_notthisone
+
+call	strend			; Skip to end of hostname in table
+ld	de, 4			; Skip address in table
+add	hl, de
+ld	a, (hl)
+or	a
+pop	de
+jr	nz, hosts_trynextmatch
+
+pop	de
+inc	a			; A set to 0 by OR A above
+
+ret
+
+
+.hosts_txt
+
+; Obvious format, but note only lower-case should be used
+
+defb	"localhost", 0, 127, 0, 0, 1
+defb	"koaks", 0, 192, 168, 4, 86
+defb	"sugar", 0, 192, 168, 6, 128
+defb	0

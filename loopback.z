@@ -1,0 +1,234 @@
+; CPC/IP loopback driver
+; Copyright (c) 1999-2000 Mark RISON
+
+
+if	MEMCONFIG - 64
+BANK_LOBUFFER	equ	&7fc6		; bank 6 at &4000
+endif
+
+
+.loopback_insert
+
+; Store packet of size BC with base HL
+; AF, BC, HL corrupted
+
+push	de
+push	ix
+
+; Check enough space
+
+push	hl
+ld	de, (lobufferinsert)
+ld	hl, (lobufferremove)
+or	a
+sbc	hl, de
+dec	hl			; HL = # chars free in buffer
+ld	a, h			; (modulo &4000)
+and	&3f			; Clears C flag too
+ld	h, a
+inc	bc
+inc	bc
+sbc	hl, bc			; Will the packet fit (with the length word)?
+dec	bc
+dec	bc
+pop	ix			; IX = base
+jr	c, loopback_wontfit
+
+ld	hl, (lobufferinsert)	; HL = buffer insertion point
+ld	d, b			; DE = size
+ld	e, c
+
+; Plonk in the size
+
+if	MEMCONFIG - 64
+ld	bc, BANK_LOBUFFER	; BC = bank switch select
+di
+out	(c), c
+endif
+
+ld	(hl), e
+inc	hl
+
+if	MEMCONFIG - 64
+set	6, h
+res	7, h
+else
+res	2, h
+endif
+
+ld	(hl), d
+inc	hl
+
+if	MEMCONFIG - 64
+set	6, h
+res	7, h
+else
+res	2, h
+endif
+
+if	MEMCONFIG - 64
+ld	c, BANK_RESTORE AND &ff
+out	(c), c
+ei
+endif
+
+.loopback_insertmore
+
+ld	a, (ix + 0)
+
+if	MEMCONFIG - 64
+di
+ld	c, BANK_LOBUFFER AND &ff
+out	(c), c
+endif
+
+ld	(hl), a
+
+if	MEMCONFIG - 64
+ld	c, BANK_RESTORE AND &ff
+out	(c), c
+ei
+endif
+
+inc	ix
+inc	hl
+
+if	MEMCONFIG - 64
+set	6, h
+res	7, h
+else
+res	2, h
+endif
+
+dec	de
+ld	a, d
+or	e
+jr	nz, loopback_insertmore
+
+ld	(lobufferinsert), hl
+
+pop	ix
+pop	de
+
+ret
+
+.loopback_wontfit
+
+if	SHOW_ERROR
+call	printstringimm
+defb	"loopback: no space", CR, LF, 0
+endif
+
+pop	ix
+pop	de
+
+ret
+
+
+.loopback_remove
+
+; Restore packet into ipbuffer and fix up (ipbufferinsert)
+; AF, BC, DE, HL, IX corrupted
+; C clear if nothing to restore
+
+ld	hl, (lobufferinsert)
+ld	de, (lobufferremove)
+or	a
+sbc	hl, de
+ret	z			; C clear too
+
+ld	ix, ipbuffer		; IX = base
+ex	de, hl			; HL = buffer removal point
+
+; Get the size
+
+if	MEMCONFIG - 64
+ld	bc, BANK_LOBUFFER	; BC = bank switch select
+di
+out	(c), c
+endif
+
+ld	e, (hl)
+inc	hl
+
+if	MEMCONFIG - 64
+set	6, h
+res	7, h
+else
+res	2, h
+endif
+
+ld	d, (hl)			; DE = size
+inc	hl
+
+if	MEMCONFIG - 64
+set	6, h
+res	7, h
+else
+res	2, h
+endif
+
+if	MEMCONFIG - 64
+ld	c, BANK_RESTORE AND &ff
+out	(c), c
+ei
+endif
+
+push	hl
+ld	hl, ipbuffer
+add	hl, de
+ld	(ipbufferinsert), hl
+pop	hl
+
+.loopback_removemore
+
+if	MEMCONFIG - 64
+di
+ld	c, BANK_LOBUFFER AND &ff
+out	(c), c
+endif
+
+ld	a, (hl)
+
+if	MEMCONFIG - 64
+ld	c, BANK_RESTORE AND &ff
+out	(c), c
+ei
+endif
+
+ld	(ix + 0), a
+
+inc	ix
+inc	hl
+
+if	MEMCONFIG - 64
+set	6, h
+res	7, h
+else
+res	2, h
+endif
+
+dec	de
+ld	a, d
+or	e
+jr	nz, loopback_removemore
+
+ld	(lobufferremove), hl
+
+ld	ix, ipbuffer
+call	ip_swapsrcdest
+
+call	ip_handle
+call	datalink_sop
+
+scf
+ret
+
+
+.lobufferinsert
+
+defw	lobuffer
+
+.lobufferremove
+
+defw	lobuffer
